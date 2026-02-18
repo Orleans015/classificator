@@ -130,10 +130,10 @@ class AEDataModule(L.LightningDataModule):
 			raise ValueError(f"Unknown normalization strategy: {self.normalization_strategy}, accepted strategies are: minmax, zscore, robust, none")
 		
 	def denormalize(self, data: torch.Tensor) -> torch.Tensor:
-		self.normalization = False
 		if not self.normalization:
 			print("Data was not normalized, returning original data")
 			return data
+		self.normalization = False
 		if self.normalization_strategy == 'minmax':
 			return data * (self.max_val - self.min_val) + self.min_val
 		elif self.normalization_strategy == 'zscore':
