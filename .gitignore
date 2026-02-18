@@ -1,0 +1,10 @@
+*.npy
+*.npz
+*.png
+*.pdf
+*.ckpt
+*.yaml
+*events*
+__pycache__
+images
+.ipynb_checkpoints*
