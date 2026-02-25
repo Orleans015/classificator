@@ -267,10 +267,6 @@ class AEDataModule(L.LightningDataModule):
 			'camera_ids': np.array(camera_ids)
 		}
 
-		# Normalize the data
-		self.normalization = False  # Reset normalization flag
-		self.profiles = self.normalize(self.profiles)
-
 		# Recreate splits with new data
 		self._recreate_splits()
 
@@ -305,9 +301,7 @@ class AEDataModule(L.LightningDataModule):
 			self.cameras = self.data.get('cameras', None)
 			self.mag_confs = self.data.get('mag_confs', None)
 			self.clippings = self.data.get('clippings', None)
-			# Normalize and recreate splits
-			self.normalization = False
-			self.profiles = self.normalize(self.profiles)
+
 			self._recreate_splits()
 			return
 
@@ -341,10 +335,6 @@ class AEDataModule(L.LightningDataModule):
 			'times': np.array(times)
 		}
 
-		# Normalize the data
-		self.normalization = False  # Reset normalization flag
-		self.profiles = self.normalize(self.profiles)
-
 		# Recreate splits with new data
 		self._recreate_splits()
 
@@ -377,9 +367,7 @@ class AEDataModule(L.LightningDataModule):
 			self.cameras = self.data.get('cameras', None)
 			self.mag_confs = self.data.get('mag_confs', None)
 			self.clippings = self.data.get('clippings', None)
-			# Normalize and recreate splits
-			self.normalization = False
-			self.profiles = self.normalize(self.profiles)
+
 			self._recreate_splits()
 			return
 
@@ -408,10 +396,6 @@ class AEDataModule(L.LightningDataModule):
 			'pids': np.array(pids),
 			'times': np.array(times)
 		}
-
-		# Normalize the data
-		self.normalization = False  # Reset normalization flag
-		self.profiles = self.normalize(self.profiles)
 
 		# Recreate splits with new data
 		self._recreate_splits()
@@ -445,9 +429,7 @@ class AEDataModule(L.LightningDataModule):
 			self.cameras = self.data.get('cameras', None)
 			self.mag_confs = self.data.get('mag_confs', None)
 			self.clippings = self.data.get('clippings', None)
-			# Normalize and recreate splits
-			self.normalization = False
-			self.profiles = self.normalize(self.profiles)
+
 			self._recreate_splits()
 			return
 
@@ -477,9 +459,6 @@ class AEDataModule(L.LightningDataModule):
 			'times': np.array(times)
 		}
 
-		# Normalize the data
-		self.normalization = False  # Reset normalization flag
-		self.profiles = self.normalize(self.profiles)
 
 		# Recreate splits with new data
 		self._recreate_splits()
