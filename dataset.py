@@ -96,15 +96,23 @@ class AEDataModule(L.LightningDataModule):
 		self.full_data = dataset
 
 	def train_dataloader(self):
+		if self.batch_size == -1:
+			self.batch_size = len(self.train_data)
 		return DataLoader(self.train_data, batch_size=self.batch_size, drop_last=True)
 
 	def val_dataloader(self):
+		if self.batch_size == -1:
+			self.batch_size = len(self.val_data)
 		return DataLoader(self.val_data, batch_size=self.batch_size, drop_last=True)
 
 	def test_dataloader(self):
+		if self.batch_size == -1:
+			self.batch_size = len(self.test_data)
 		return DataLoader(self.test_data, batch_size=self.batch_size, drop_last=True)
 
 	def full_dataloader(self):
+		if self.batch_size == -1:
+			self.batch_size = len(self.full_data)
 		return DataLoader(self.full_data, batch_size=self.batch_size, drop_last=True)
 
 	def normalize(self, data: torch.Tensor) -> torch.Tensor:
