@@ -43,6 +43,13 @@ class AEDataModule(L.LightningDataModule):
 		self.normalization_strategy = normalization_strategy
 		self.nprofiles = nprofiles
 		self.data = None
+		# Normalization parameters
+		self.min_val = None
+		self.max_val = None
+		self.mean = None
+		self.std = None
+		self.median = None
+		self.iqr = None
 
 	def prepare_data(self):
 		# Check if the file in data_dir exists otherwise create it calling the create_db method
@@ -116,55 +123,107 @@ class AEDataModule(L.LightningDataModule):
 		return DataLoader(self.full_data, batch_size=self.batch_size, drop_last=True)
 
 	def normalize(self, data: torch.Tensor) -> torch.Tensor:
+		"""
+		Normalize the input data based on the specified strategy.
+		
+		Args:
+			data (torch.Tensor): The data to normalize
+			
+		Returns:
+			torch.Tensor: The normalized data
+		"""
 		if self.normalization:
 			print("Data is already normalized, returning original data")
 			return data
-		self.normalization = True
+		
+		normalized_data = None
+		
 		if self.normalization_strategy == 'minmax':
 			self.min_val = data.min()
 			self.max_val = data.max()
-			return (data - self.min_val) / (self.max_val - self.min_val)
+			normalized_data = (data - self.min_val) / (self.max_val - self.min_val)
 		elif self.normalization_strategy == 'zscore':
 			self.mean = data.mean()
 			self.std = data.std()
-			return (data - self.mean) / self.std
+			normalized_data = (data - self.mean) / self.std
 		elif self.normalization_strategy == 'robust':
 			self.median = data.median()
 			self.iqr = data.quantile(0.75) - data.quantile(0.25)
-			return (data - self.median) / self.iqr
+			normalized_data = (data - self.median) / self.iqr
 		elif self.normalization_strategy == 'none':
-			return data
+			normalized_data = data
 		else:
 			raise ValueError(f"Unknown normalization strategy: {self.normalization_strategy}, accepted strategies are: minmax, zscore, robust, none")
 		
+		# Set normalization flag AFTER successful normalization
+		self.normalization = True
+		return normalized_data
+		
 	def denormalize(self, data: torch.Tensor) -> torch.Tensor:
+		"""
+		Denormalize the input data based on the normalization strategy used.
+		
+		Args:
+			data (torch.Tensor): The normalized data to denormalize
+			
+		Returns:
+			torch.Tensor: The denormalized (original scale) data
+		"""
 		if not self.normalization:
 			print("Data was not normalized, returning original data")
 			return data
-		self.normalization = False
+		
+		denormalized_data = None
+		
 		if self.normalization_strategy == 'minmax':
-			return data * (self.max_val - self.min_val) + self.min_val
+			denormalized_data = data * (self.max_val - self.min_val) + self.min_val
 		elif self.normalization_strategy == 'zscore':
-			return data * self.std + self.mean
+			denormalized_data = data * self.std + self.mean
 		elif self.normalization_strategy == 'robust':
-			return data * self.iqr + self.median
+			denormalized_data = data * self.iqr + self.median
 		elif self.normalization_strategy == 'none':
-			return data
+			denormalized_data = data
 		else:
 			raise ValueError(f"Unknown normalization strategy: {self.normalization_strategy}, accepted strategies are: minmax, zscore, robust, none")
+		
+		# Set the normalization flag to False after denormalization
+		self.normalization = False
+		return denormalized_data
 
-	def divide_by_camera(self, camera_list: list = None) -> dict:
+	def _recreate_splits(self, generator_seed: int = 42):
+		"""
+		Helper method to recreate train/val/test splits after data manipulation.
+		Called internally by data manipulation methods.
+		
+		Args:
+			generator_seed (int): Seed for reproducibility
+		"""
+		generator = torch.Generator().manual_seed(generator_seed)
+		
+		# Create dataset
+		dataset = AEDataset(self.profiles, self.pids, self.times, self.cameras, 
+					  self.mag_confs, self.clippings)
+		
+		# Create the dataset train, validation, and test splits
+		self.train_data, self.val_data, self.test_data = random_split(
+			dataset, [0.8, 0.1, 0.1], generator=generator)
+		
+		# Create full dataset
+		self.full_data = dataset
+
+	def divide_by_camera(self, camera_list: list = None, save_file: bool = True) -> dict:
 		"""
 		Divides the input data by the camera.
 
 		Args:
 			camera_list (list, optional): The list of cameras to divide the data in.
+			save_file (bool): Whether to save the divided data to an npz file.
 
 		Returns:
 			(dict): The modified data dictionary.
 		"""
 		# Load the raw data from the directory and filename
-		data = np.load(f"{self.data_dir}/{self.file_name}")
+		data = self.data if self.data is not None else np.load(f"{self.data_dir}/{self.file_name}")
 
 		# Create the lists to hold the divided data
 		profiles = []
@@ -180,9 +239,10 @@ class AEDataModule(L.LightningDataModule):
 			'4A': (270, 287), '4B': (288, 305), '4C': (306, 323), '4D': (324, 341), '4E': (342, 359)
 		}
 
-		#Redefine the profiles arrangements
+		# Redefine the profiles arrangements
 		if camera_list is None:
 			camera_list = list(camera_ranges.keys())
+		
 		for profile in data["profiles"]:
 			for camera in camera_list:
 				if camera not in camera_ranges: # Check if camera is in the defined ranges and skip if not
@@ -193,6 +253,7 @@ class AEDataModule(L.LightningDataModule):
 				times.append(data["times"])
 				camera_ids.append(camera)
 
+		# Update instance variables
 		self.profiles = torch.tensor(profiles, dtype=torch.float32)
 		self.pids = np.array(pids)
 		self.times = np.array(times)
@@ -206,17 +267,29 @@ class AEDataModule(L.LightningDataModule):
 			'camera_ids': np.array(camera_ids)
 		}
 
-		# save the file to an npz
-		print("Saving divided data by camera to npz file...")
-		np.savez_compressed(f"{self.data_dir}/db_by_camera.npz", **self.data)
-		print("Data saved successfully.")
+		# Normalize the data
+		self.normalization = False  # Reset normalization flag
+		self.profiles = self.normalize(self.profiles)
 
-	def get_pids(self, pid_list: list = None, filename="db_by_pid.npz"):
+		# Recreate splits with new data
+		self._recreate_splits()
+
+		# Save the file to an npz if requested
+		if save_file:
+			print("Saving divided data by camera to npz file...")
+			np.savez_compressed(f"{self.data_dir}/db_by_camera.npz", **self.data)
+			print("Data saved successfully.")
+
+		return self.data
+
+	def get_pids(self, pid_list: list = None, filename="db_by_pid.npz", save_file: bool = True):
 		"""
 		Divides the input data by the pid.
 
 		Args:
 			pid_list (list, optional): The list of pids to divide the data in.
+			filename (str): The filename to save/load the data.
+			save_file (bool): Whether to save the divided data to an npz file.
 
 		Returns:
 			None.
@@ -225,9 +298,22 @@ class AEDataModule(L.LightningDataModule):
 			print(f"The file {filename} already exists in path {self.data_dir}, loading it...")
 			self.data = np.load(f"{self.data_dir}/{filename}")
 			print("Data loaded successfully.")
+			# Update instance variables from loaded data
+			self.profiles = torch.tensor(self.data['profiles'], dtype=torch.float32)
+			self.pids = self.data['pids']
+			self.times = self.data['times']
+			self.cameras = self.data.get('cameras', None)
+			self.mag_confs = self.data.get('mag_confs', None)
+			self.clippings = self.data.get('clippings', None)
+			# Normalize and recreate splits
+			self.normalization = False
+			self.profiles = self.normalize(self.profiles)
+			self._recreate_splits()
 			return
+
 		# Load the raw data from the directory and filename
 		data = self.data if self.data is not None else np.load(f"{self.data_dir}/{self.file_name}")
+		
 		# Create the lists to hold the divided data
 		profiles = []
 		pids = []
@@ -236,12 +322,14 @@ class AEDataModule(L.LightningDataModule):
 		# Define pids
 		if pid_list is None:
 			pid_list = np.unique(data["pids"])
+		
 		for profile, pid, time in zip(data["profiles"], data["pids"], data["times"]):
 			if pid in pid_list: # Check if pid is in the defined list and skip if not
 				profiles.append(profile) # Append the sliced data for the current pid
 				pids.append(pid)
 				times.append(time)
 
+		# Update instance variables
 		self.profiles = torch.tensor(profiles, dtype=torch.float32)
 		self.pids = np.array(pids)
 		self.times = np.array(times)
@@ -253,17 +341,27 @@ class AEDataModule(L.LightningDataModule):
 			'times': np.array(times)
 		}
 
-		# save the file to an npz
-		print("Saving divided data by pid to npz file...")
-		np.savez_compressed(f"{self.data_dir}/{filename}", **self.data)
-		print("Data saved successfully.")
+		# Normalize the data
+		self.normalization = False  # Reset normalization flag
+		self.profiles = self.normalize(self.profiles)
 
-	def exclude_pids(self, pid_list: list, filename="db_excluded_pid.npz"):
+		# Recreate splits with new data
+		self._recreate_splits()
+
+		# Save the file to an npz if requested
+		if save_file:
+			print("Saving divided data by pid to npz file...")
+			np.savez_compressed(f"{self.data_dir}/{filename}", **self.data)
+			print("Data saved successfully.")
+
+	def exclude_pids(self, pid_list: list, filename="db_excluded_pid.npz", save_file: bool = True):
 		"""
 		Excludes the specified pids from the input data.
 
 		Args:
 			pid_list (list): The list of pids to exclude from the data.
+			filename (str): The filename to save/load the data.
+			save_file (bool): Whether to save the excluded data to an npz file.
 
 		Returns:
 			None
@@ -272,9 +370,22 @@ class AEDataModule(L.LightningDataModule):
 			print(f"The file {filename} already exists in path {self.data_dir}, loading it...")
 			self.data = np.load(f"{self.data_dir}/{filename}")
 			print("Data loaded successfully.")
+			# Update instance variables from loaded data
+			self.profiles = torch.tensor(self.data['profiles'], dtype=torch.float32)
+			self.pids = self.data['pids']
+			self.times = self.data['times']
+			self.cameras = self.data.get('cameras', None)
+			self.mag_confs = self.data.get('mag_confs', None)
+			self.clippings = self.data.get('clippings', None)
+			# Normalize and recreate splits
+			self.normalization = False
+			self.profiles = self.normalize(self.profiles)
+			self._recreate_splits()
 			return
+
 		# Load the raw data from the directory and filename
 		data = self.data if self.data is not None else np.load(f"{self.data_dir}/{self.file_name}")
+		
 		# Create the lists to hold the divided data
 		profiles = []
 		pids = []
@@ -286,6 +397,7 @@ class AEDataModule(L.LightningDataModule):
 				pids.append(pid)
 				times.append(time)
 		
+		# Update instance variables
 		self.profiles = torch.tensor(profiles, dtype=torch.float32)
 		self.pids = np.array(pids)
 		self.times = np.array(times)
@@ -297,17 +409,28 @@ class AEDataModule(L.LightningDataModule):
 			'times': np.array(times)
 		}
 
-		# save the file to an npz
-		print("Saving excluded data by pid to npz file...")
-		np.savez_compressed(f"{self.data_dir}/{filename}", **self.data)
-		print("Data saved successfully.")
+		# Normalize the data
+		self.normalization = False  # Reset normalization flag
+		self.profiles = self.normalize(self.profiles)
 
-	def cut_time_intervals(self, time_intervals: list, filename="db_cut_time_intervals.npz"):
+		# Recreate splits with new data
+		self._recreate_splits()
+
+		# Save the file to an npz if requested
+		if save_file:
+			print("Saving excluded data by pid to npz file...")
+			np.savez_compressed(f"{self.data_dir}/{filename}", **self.data)
+			print("Data saved successfully.")
+
+	def cut_time_intervals(self, time_intervals: list, filename="db_cut_time_intervals.npz", save_file: bool = True):
 		"""
 		Gets the specified time intervals from the input data.
 
 		Args:
-			time_intervals (tuple): this are the start and end time in which the data should be found (start_time, end_time).
+			time_intervals (list): List of tuples with (start_time, end_time) intervals to keep.
+			filename (str): The filename to save/load the data.
+			save_file (bool): Whether to save the cut data to an npz file.
+
 		Returns:
 			None
 		"""
@@ -315,19 +438,38 @@ class AEDataModule(L.LightningDataModule):
 			print(f"The file {filename} already exists in path {self.data_dir}, loading it...")
 			self.data = np.load(f"{self.data_dir}/{filename}")
 			print("Data loaded successfully.")
+			# Update instance variables from loaded data
+			self.profiles = torch.tensor(self.data['profiles'], dtype=torch.float32)
+			self.pids = self.data['pids']
+			self.times = self.data['times']
+			self.cameras = self.data.get('cameras', None)
+			self.mag_confs = self.data.get('mag_confs', None)
+			self.clippings = self.data.get('clippings', None)
+			# Normalize and recreate splits
+			self.normalization = False
+			self.profiles = self.normalize(self.profiles)
+			self._recreate_splits()
 			return
+
 		# Load the raw data from the directory and filename
 		data = self.data if self.data is not None else np.load(f"{self.data_dir}/{self.file_name}")
+		
 		# Create the lists to hold the divided data
 		profiles = []
 		pids = []
 		times = []
 		
 		for profile, pid, time in zip(data["profiles"], data["pids"], data["times"]):
-			if any(start <= time <= end for start, end in time_intervals): # Check if time is in the defined intervals and skip if it is not
-				profiles.append(profile) # Append the sliced data for the current time
+			if any(start <= time <= end for start, end in time_intervals): # Check if time is in the defined intervals
+				profiles.append(profile)
 				pids.append(pid)
 				times.append(time)
+		
+		# Update instance variables
+		self.profiles = torch.tensor(profiles, dtype=torch.float32)
+		self.pids = np.array(pids)
+		self.times = np.array(times)
+
 		# Combine the lists into a dictionary
 		self.data = {
 			'profiles': np.array(profiles),
@@ -335,7 +477,15 @@ class AEDataModule(L.LightningDataModule):
 			'times': np.array(times)
 		}
 
-		# save the file to an npz
-		print("Saving cut data by time intervals to npz file...")
-		np.savez_compressed(f"{self.data_dir}/{filename}", **self.data)
-		print("Data saved successfully.")
+		# Normalize the data
+		self.normalization = False  # Reset normalization flag
+		self.profiles = self.normalize(self.profiles)
+
+		# Recreate splits with new data
+		self._recreate_splits()
+
+		# Save the file to an npz if requested
+		if save_file:
+			print("Saving cut data by time intervals to npz file...")
+			np.savez_compressed(f"{self.data_dir}/{filename}", **self.data)
+			print("Data saved successfully.")
