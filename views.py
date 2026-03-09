@@ -32,6 +32,17 @@ GAIN_PIDS = ["20250416.44", "20250416.30", "20250416.24", "20250410.45", "202504
 			"20250401.78", "20250401.77", "20250401.70", "20250401.60", "20250401.53", "20250401.49",
 			"20241128.69", "20241128.70"]
 
+DETECTED_FAULTS = ['20250305.40' '20250305.50' '20250312.107' '20250312.114' '20250312.116'
+ '20250312.119' '20250312.91' '20250312.93' '20250319.62' '20250319.65'
+ '20250319.69' '20250319.75' '20250319.76' '20250319.78' '20250319.89'
+ '20250325.104' '20250325.88' '20250326.102' '20250326.105' '20250401.49'
+ '20250401.53' '20250401.70' '20250401.77' '20250401.78' '20250402.13'
+ '20250402.14' '20250402.16' '20250402.18' '20250402.46' '20250402.62'
+ '20250402.79' '20250402.8' '20250402.82' '20250403.13' '20250403.17'
+ '20250403.20' '20250403.23' '20250403.26' '20250403.54' '20250409.21'
+ '20250409.22' '20250409.47' '20250410.5' '20250415.49' '20250415.50'
+ '20250415.76']
+
 
 def plot_latent_space(encoder, data_loader, device, save_path=None):
 	"""
@@ -1055,6 +1066,80 @@ def plot_profiles(model, dataloader, device, num_samples=5):
 		plt.legend()
 		plt.savefig(f"images/profile_{i}.png")
 		plt.close()
+
+def plot_profiles_byPID(model, dataloader, device, target_pid, num_samples=5):
+	'''
+	Plot profiles for a specific PID.
+	'''
+	model.eval()
+	with torch.no_grad():
+		for batch in dataloader:
+			if target_pid in batch['pid']:
+				x = batch['profile'].to(device)
+				z = model.encoder(x)
+				recon = model.decoder(z).cpu().numpy()
+				pids = batch['pid']
+				times = batch['time']
+				count = 0
+				for i, pid in enumerate(pids):
+					if pid == target_pid:
+						orig = x[i].cpu().numpy()
+						y_min = min(orig.min(), recon[i].min())
+						y_max = max(orig.max(), recon[i].max())
+						residuals = orig - recon[i]
+						
+						fig, axes = plt.subplots(3, 1, figsize=(14, 8))
+						axes[0].plot(orig, label="Original", marker="*")
+						axes[0].set_title(f"Original Profile - PID: {pid} | Time: {times[i]}")
+						axes[0].set_ylim(y_min, y_max)
+						axes[0].legend()
+						axes[0].grid(True, alpha=0.3)
+						
+						axes[1].plot(recon[i], label="Reconstructed", marker="x")
+						axes[1].set_title(f"Reconstructed Profile - PID: {pid} | Time: {times[i]}")
+						axes[1].set_ylim(y_min, y_max)
+						axes[1].legend()
+						axes[1].grid(True, alpha=0.3)
+						
+						axes[2].plot(residuals, label="Residuals (Original - Reconstructed)", marker="o", color="red")
+						axes[2].set_title("Residuals")
+						axes[2].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+						axes[2].legend()
+						axes[2].grid(True, alpha=0.3)
+						
+						plt.tight_layout()
+						plt.show()
+						count += 1
+						if count >= num_samples:
+							break
+
+def plot_profiles_PID_and_time(data, pid, time, nprof=5):
+	'''
+	Plot profiles for a specific PID and time.
+
+	Params:
+	data: The dataset containing profiles, pids, and times.
+	pid: The PID to filter by.
+	time: The time to filter by.
+	nprof: The number of profiles to plot (default is 5).
+	'''
+
+	data = data[data.pids == pid]
+	print(f"Found {len(data)} profiles for PID: {pid}")
+	print(f"Available times for PID {pid}: {data['time']}")
+	time_index = np.isclose(data['time'], time, atol=1e-2)
+	time = data['time'][time_index]
+	if len(time) > 0:
+		profiles = data['profile'][time_index, :]  # Assuming profile is stored as a 2D array (num_profiles, profile_length)
+		for i in range(min(len(profiles), nprof)):  # Plot up to nprof profiles
+			plt.figure(figsize=(14, 8))
+			plt.plot(profiles[i], label=f"PID: {pid} | Time: {time[i]}", marker="o")
+			plt.title(f"Profile - PID: {pid} | Time: {time[i]}")
+			plt.legend()
+			plt.grid(True, alpha=0.3)
+		plt.show()
+	else:
+		print(f"No profiles found for PID: {pid} at Time: {time}")
 
 def compute_std_dev_latent(model, dataloader, device):
 	'''

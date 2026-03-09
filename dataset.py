@@ -91,6 +91,17 @@ class AEDataModule(L.LightningDataModule):
 		# Normalize the data
 		self.profiles = self.normalize(self.profiles)
 
+		# Overwrite the data dictionary with the normalized profiles
+		data = {
+			'profiles': self.profiles.numpy(),
+			'pids': self.pids,
+			'times': self.times,
+			'cameras': self.cameras,
+			'mag_confs': self.mag_confs,
+			'clippings': self.clippings
+		}
+		self.data = data
+
 		# Initialize the Dataset
 		dataset = AEDataset(self.profiles, self.pids, self.times, self.cameras, 
 					  self.mag_confs, self.clippings)
@@ -386,7 +397,7 @@ class AEDataModule(L.LightningDataModule):
 				times.append(time)
 		
 		# Update instance variables
-		self.profiles = torch.tensor(profiles, dtype=torch.float32)
+		self.profiles = torch.tensor(np.array(profiles), dtype=torch.float32)
 		self.pids = np.array(pids)
 		self.times = np.array(times)
 
