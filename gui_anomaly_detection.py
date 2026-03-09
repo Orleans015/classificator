@@ -196,14 +196,14 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
     model.eval()
 
     _p(f"Loading SXR data for PID {pid} …")
-    data         = load_sxr_data(pid)
-    time_base    = data[0, :]
-    signals      = data[1:, :]
-    max_emission = int(np.argmax(data[152, :]))
-    time_instant = float(time_base[max_emission])
-    profile      = data[1:, max_emission].copy()
-    n_diodes     = len(profile)
-    x            = np.arange(n_diodes)
+    data, fpath, data_dict  = load_sxr_data(pid)
+    time_base               = data[0, :]
+    signals                 = data[1:, :]
+    max_emission            = int(np.argmax(data[152, :]))
+    time_instant            = float(time_base[max_emission])
+    profile                 = data[1:, max_emission].copy()
+    n_diodes                = len(profile)
+    x                       = np.arange(n_diodes)
 
     # ── original reconstruction ───────────────────────────────────────────────
     _p("Running model on original profile …")
@@ -249,18 +249,28 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
     spline_final = best_spline(x)
     outlier_mask = ~mask
 
-    # ── gain-corrected adjusted profile ──────────────────────────────────────
+    # ── gain-corrected adjusted profiles ─────────────────────────────────────
     adjusted        = profile.copy()
+    adjusted_full   = signals.copy()
     adjusted[mask] *= gain_ratio
+    adjusted_full[mask, :] *= gain_ratio
 
     # ── reconstruction of adjusted profile ───────────────────────────────────
     _p("Running model on adjusted profile …")
     with torch.no_grad():
-        an = (adjusted - min_data) / (max_data - min_data)
-        at = torch.tensor(an, dtype=torch.float32).unsqueeze(0)
-        ar = model(at).squeeze(0).numpy()
-    rec_adjusted  = ar * (max_data - min_data) + min_data
+        at = (adjusted - min_data) / (max_data - min_data)
+        at = torch.tensor(at, dtype=torch.float32).unsqueeze(0)
+        at = model(at).squeeze(0).numpy()
+    rec_adjusted  = at * (max_data - min_data) + min_data
     corr_adjusted = float(np.corrcoef(adjusted, rec_adjusted)[0, 1])
+
+    # ── reconstruction of adjusted full time-series ──────────────────────────
+    _p("Running model on adjusted full time-series …")
+    with torch.no_grad():
+        at_full = (adjusted_full - min_data) / (max_data - min_data)
+        at_full = torch.tensor(at_full, dtype=torch.float32).T
+        at_full = model(at_full).squeeze(0).numpy()
+    rec_adjusted_full  = at_full * (max_data - min_data) + min_data
 
     # ── correlation time-series ───────────────────────────────────────────────
     _p("Computing correlation time-series …")
@@ -278,20 +288,25 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
 
     _p("Done.")
     return dict(
-        pid           = pid,
-        time_instant  = time_instant,
-        x             = x,
-        time_base     = time_base[indices],
-        profile       = profile,
-        rec_original  = rec_original,
-        spline_final  = spline_final,
-        outlier_mask  = outlier_mask,
-        adjusted      = adjusted,
-        rec_adjusted  = rec_adjusted,
-        corr_original = corr_original,
-        corr_adjusted = corr_adjusted,
-        correlations  = correlations,
-        diode_signal  = data[152, indices],
+        pid               = pid,
+        time_instant      = time_instant,
+        x                 = x,
+        time_base         = time_base[indices],
+        profile           = profile,
+        rec_original      = rec_original,
+        spline_final      = spline_final,
+        outlier_mask      = outlier_mask,
+        adjusted          = adjusted,
+        rec_adjusted      = rec_adjusted,
+        adjusted_full     = adjusted_full,
+        time_base_full    = time_base,
+        rec_adjusted_full = rec_adjusted_full.T,
+        corr_original     = corr_original,
+        corr_adjusted     = corr_adjusted,
+        correlations      = correlations,
+        diode_signal      = data[152, indices],
+        file_path         = fpath,
+        data_dict         = data_dict,
     )
 
 
@@ -327,8 +342,9 @@ class WorkflowGUI(QMainWindow):
         self.setMinimumSize(1100, 700)
         self.setStyleSheet(STYLESHEET)
 
-        self._thread = None
-        self._worker = None
+        self._thread  = None
+        self._worker  = None
+        self._results = None
         self._build_ui()
 
     # ── layout ────────────────────────────────────────────────────────────────
@@ -436,6 +452,11 @@ class WorkflowGUI(QMainWindow):
         self._run_btn.setObjectName("run")
         self._run_btn.clicked.connect(self._run)
         lay.addWidget(self._run_btn)
+        self._save_btn = QPushButton("💾  SAVE ADJUSTED DATA")
+        self._save_btn.setObjectName("run")
+        self._save_btn.setEnabled(False)
+        self._save_btn.clicked.connect(self._save_adjusted_data)
+        lay.addWidget(self._save_btn)
 
         # correlation readout
         lay.addSpacing(6)
@@ -533,8 +554,10 @@ class WorkflowGUI(QMainWindow):
         QMessageBox.critical(self, "Analysis failed", msg)
 
     def _on_results(self, r):
+        self._results = r
         self._run_btn.setEnabled(True)
         self._run_btn.setText("▶  RUN ANALYSIS")
+        self._save_btn.setEnabled(True)
         self._status_lbl.setText(
             f"PID {r['pid']}  |  t = {r['time_instant']:.2f} ms  "
             f"|  ρ_orig = {r['corr_original']:.4f}  "
@@ -655,6 +678,42 @@ class WorkflowGUI(QMainWindow):
         v_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
         self._corr_layout.addWidget(v_lbl, 2, 0, 1, 2)
 
+    # ── save function ─────────────────────────────────────────────────────────
+
+    def _save_adjusted_data(self):
+        if self._results is None:
+            QMessageBox.warning(self, "No data", "Run the analysis first.")
+            return
+
+        import h5py, os
+
+        r             = self._results
+        h5py_path     = r["file_path"]
+        pid           = r["pid"]
+        data_dict     = r["data_dict"]
+        rec_adjusted_full = r["rec_adjusted_full"]  # (n_diodes, n_time)
+        # adjusted_full = r["adjusted_full"]   # (n_diodes, n_time)
+        time_base     = r["time_base_full"]
+
+        # create a subdirectory alongside the original to keep things tidy
+        save_dir = os.path.join(os.path.dirname(h5py_path.rstrip("/")),
+                                f"{pid}_adjusted")
+        os.makedirs(save_dir, exist_ok=True)
+
+        diode_keys = [k for k in data_dict.keys() if k != "time_base"]
+
+        try:
+            for i, key in enumerate(diode_keys):
+                dst_path = os.path.join(save_dir, f"{key}.h5f")
+                with h5py.File(dst_path, "w") as f:
+                    grp = f.create_group("XMCTSdata")
+                    grp.create_dataset("time_base", data=time_base)
+                    grp.create_dataset(key,         data=rec_adjusted_full[i, :])
+
+            self._status_lbl.setText(f"Saved {len(diode_keys)} files → {save_dir}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed", str(e))
 
 # ─────────────────────────────────────────────────────────────────────────────
 

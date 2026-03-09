@@ -103,13 +103,14 @@ def load_sxr_data(pid: str, base_path: str = "/home/IPP-HGW/orluca/devel/data/HD
     h5py_path = os.path.join(base_path, pid_formatted, "")
     data_dict = read_h5f_directory(h5py_path)
     data = build_data_array(data_dict)
-    return data
+    return data, h5py_path, data_dict
 
 
 if __name__ == "__main__":
     pid = "20250305.50"
-    data = load_sxr_data(pid)
+    data, h5py_path, data_dict = load_sxr_data(pid)
     print(f"Loaded data array with shape: {data.shape}")
+    print(f"H5F path: {h5py_path}")
     print("First time instant across all channels:")
     for d in data[:, 0]:
         print(d)

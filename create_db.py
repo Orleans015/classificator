@@ -48,5 +48,5 @@ def organize_data(data):
 	return profiles, times
 
 if __name__ == "__main__":
-	data = load_sxr_data(r"S:\E5-Praktikanten\Orlandi_Luca\_data\npz_files")
+	data, _, _ = load_sxr_data(r"S:\E5-Praktikanten\Orlandi_Luca\_data\npz_files")
 	profiles, times = organize_data(data)
