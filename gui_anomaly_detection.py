@@ -260,7 +260,7 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
         at = torch.tensor(an, dtype=torch.float32).unsqueeze(0)
         ar = model(at).squeeze(0).numpy()
     rec_adjusted  = ar * (max_data - min_data) + min_data
-    corr_adjusted = float(np.corrcoef(profile, rec_adjusted)[0, 1])
+    corr_adjusted = float(np.corrcoef(adjusted, rec_adjusted)[0, 1])
 
     # ── correlation time-series ───────────────────────────────────────────────
     _p("Computing correlation time-series …")
@@ -268,9 +268,12 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
     with torch.no_grad():
         rec_all = model(torch.tensor(dn.T, dtype=torch.float32)).numpy().T
     dn_all       = rec_all * (max_data - min_data) + min_data
+    # adding a decimation step here to speed up the correlation computation
+    step = max(10, len(time_base) // 500)
+    indices = np.arange(0, len(time_base), step)
     correlations = np.array([
         float(np.corrcoef(signals[:, i], dn_all[:, i])[0, 1])
-        for i in range(data.shape[1])
+        for i in indices
     ])
 
     _p("Done.")
@@ -278,7 +281,7 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
         pid           = pid,
         time_instant  = time_instant,
         x             = x,
-        time_base     = time_base,
+        time_base     = time_base[indices],
         profile       = profile,
         rec_original  = rec_original,
         spline_final  = spline_final,
@@ -288,7 +291,7 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
         corr_original = corr_original,
         corr_adjusted = corr_adjusted,
         correlations  = correlations,
-        diode_signal  = data[152, :],
+        diode_signal  = data[152, indices],
     )
 
 
@@ -449,13 +452,14 @@ class WorkflowGUI(QMainWindow):
 
         self._fig = Figure(figsize=(10, 7), dpi=100, facecolor=BG)
         gs = gridspec.GridSpec(2, 2, figure=self._fig,
-                               hspace=0.42, wspace=0.34,
-                               left=0.07, right=0.97,
+                               hspace=0.42, wspace=0.20,
+                               left=0.07, right=0.93,
                                top=0.93, bottom=0.08)
         self._ax_orig = self._fig.add_subplot(gs[0, 0])
         self._ax_adj  = self._fig.add_subplot(gs[0, 1])
         self._ax_rec  = self._fig.add_subplot(gs[1, 0])
         self._ax_corr = self._fig.add_subplot(gs[1, 1])
+        self.twin_ax_corr = self._ax_corr.twinx()
 
         for ax, title in [
             (self._ax_orig, "Original profile  vs  Reconstruction"),
@@ -547,6 +551,10 @@ class WorkflowGUI(QMainWindow):
             ax.cla()
             ax.grid(True)
             ax.set_facecolor(PANEL)
+        # clear twin axis and reset its properties
+        self.twin_ax_corr.cla()
+        self.twin_ax_corr.yaxis.set_label_position("right")
+        self.twin_ax_corr.yaxis.tick_right()
 
         x, ti, pid = r["x"], r["time_instant"], r["pid"]
 
@@ -564,33 +572,34 @@ class WorkflowGUI(QMainWindow):
         # panel 2 — adjusted profile with outliers
         ax  = self._ax_adj
         out = r["outlier_mask"]
-        ax.plot(x, r["profile"],      color=FG_DIM,  lw=1.2, ls="--",
-                alpha=0.6, label="Original")
-        ax.plot(x, r["adjusted"],     color=ACCENT3, lw=1.8,
-                label="Adjusted")
-        ax.plot(x, r["spline_final"], color=ACCENT2, lw=1.2, ls=":",
-                alpha=0.7, label="Spline fit")
-        if out.any():
+        if out.any() and r["corr_original"] < 0.9:
+            ax.plot(x, r["profile"],      color=FG_DIM,  lw=1.2, ls="--",
+                    alpha=0.6, label="Original")
+            ax.plot(x, r["adjusted"],     color=ACCENT3, lw=1.8,
+                    label="Adjusted")
+            ax.plot(x, r["spline_final"], color=ACCENT2, lw=1.2, ls=":",
+                    alpha=0.7, label="Spline fit")
             ax.scatter(x[out], r["profile"][out],
-                       color=ACCENT4, marker="x", s=80, lw=1.8,
-                       label=f"Outliers ({out.sum()})", zorder=5)
-        ax.set_title("Adjusted Profile  (gain correction)", color=FG, pad=8)
-        ax.set_xlabel("Diode index")
-        ax.set_ylabel("Signal [V]")
-        ax.legend(fontsize=8)
+                        color=ACCENT4, marker="x", s=80, lw=1.8,
+                        label=f"Outliers ({out.sum()})", zorder=5)
+            ax.set_title("Adjusted Profile  (gain correction)", color=FG, pad=8)
+            ax.set_xlabel("Diode index")
+            ax.set_ylabel("Signal [V]")
+            ax.legend(fontsize=8)
 
         # panel 3 — adjusted + AE reconstruction
         ax = self._ax_rec
-        ax.plot(x, r["profile"],      color=FG_DIM,  lw=1.2, ls="--",
-                alpha=0.6, label="Original")
-        ax.plot(x, r["adjusted"],     color=ACCENT3, lw=1.8,
-                label="Adjusted")
-        ax.plot(x, r["rec_adjusted"], color=ACCENT2, lw=1.8, ls="--",
-                label=f"AE recon (adj)  (ρ = {r['corr_adjusted']:.4f})")
-        ax.set_title("Adjusted  vs  AE Reconstruction", color=FG, pad=8)
-        ax.set_xlabel("Diode index")
-        ax.set_ylabel("Signal [V]")
-        ax.legend(fontsize=8)
+        if r["outlier_mask"].any() and r["corr_original"] < 0.9:
+            ax.plot(x, r["profile"],      color=FG_DIM,  lw=1.2, ls="--",
+                    alpha=0.6, label="Original")
+            ax.plot(x, r["adjusted"],     color=ACCENT3, lw=1.8,
+                    label="Adjusted")
+            ax.plot(x, r["rec_adjusted"], color=ACCENT2, lw=1.8, ls="--",
+                    label=f"AE recon (adj)  (ρ = {r['corr_adjusted']:.4f})")
+            ax.set_title("Adjusted  vs  AE Reconstruction", color=FG, pad=8)
+            ax.set_xlabel("Diode index")
+            ax.set_ylabel("Signal [V]")
+            ax.legend(fontsize=8)
 
         # panel 4 — correlation over time
         ax  = self._ax_corr
@@ -601,19 +610,18 @@ class WorkflowGUI(QMainWindow):
         ax.plot(t, cor, color=ACCENT, lw=1.0, alpha=0.4, zorder=2)
         ax.axhline(0.9, color=WARNING, lw=1.2, ls="--", label="Threshold 0.9")
         ax.axvline(ti,  color=ACCENT2, lw=1.2, ls=":",  label=f"t = {ti:.1f} ms")
-        ax2 = ax.twinx()
-        ax2.plot(t, r["diode_signal"], color=ACCENT2,
+        self.twin_ax_corr.plot(t, r["diode_signal"], color=ACCENT2,
                  lw=1.0, alpha=0.45, label="Diode #151")
-        ax2.set_ylabel("Diode #151 [V]", color=ACCENT2, fontsize=8)
-        ax2.tick_params(axis="y", labelcolor=ACCENT2, labelsize=7)
-        ax2.set_facecolor(PANEL)
+        self.twin_ax_corr.set_ylabel("Diode #151 [V]", color=ACCENT2, fontsize=8)
+        self.twin_ax_corr.tick_params(axis="y", labelcolor=ACCENT2, labelsize=7)
+        self.twin_ax_corr.set_facecolor(PANEL)
         ax.set_title("Correlation  over  Time", color=FG, pad=8)
         ax.set_xlabel("Time [ms]")
         ax.set_ylabel("Pearson ρ", color=ACCENT)
         ax.tick_params(axis="y", labelcolor=ACCENT)
         ax.set_ylim(-0.1, 1.05)
         l1, lb1 = ax.get_legend_handles_labels()
-        l2, lb2 = ax2.get_legend_handles_labels()
+        l2, lb2 = self.twin_ax_corr.get_legend_handles_labels()
         ax.legend(l1 + l2, lb1 + lb2, fontsize=7, loc="lower left")
 
         self._fig.suptitle(
@@ -640,8 +648,8 @@ class WorkflowGUI(QMainWindow):
             self._corr_layout.addWidget(lbl, row_idx, 0)
             self._corr_layout.addWidget(val, row_idx, 1)
 
-        verdict = "▸  NORMAL" if r["corr_adjusted"] >= 0.9 else "▸  ANOMALY"
-        obj     = "verdict_ok" if r["corr_adjusted"] >= 0.9 else "verdict_bad"
+        verdict = "▸  NORMAL" if r["corr_original"] >= 0.9 else "▸  ANOMALY"
+        obj     = "verdict_ok" if r["corr_original"] >= 0.9 else "verdict_bad"
         v_lbl   = QLabel(verdict)
         v_lbl.setObjectName(obj)
         v_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
