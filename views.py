@@ -1137,9 +1137,61 @@ def plot_profiles_PID_and_time(data, pid, time, nprof=5):
 			plt.title(f"Profile - PID: {pid} | Time: {time[i]}")
 			plt.legend()
 			plt.grid(True, alpha=0.3)
+			plt.tight_layout()
 		plt.show()
 	else:
 		print(f"No profiles found for PID: {pid} at Time: {time}")
+
+def plot_profiles_PID_and_time_model(model, dataloader, device, target_pid, target_time, nprof=5):
+	'''
+	Plot profiles for a specific PID and time, along with model reconstructions.
+
+	Params:
+	model: The autoencoder model.
+	dataloader: The dataloader providing the dataset.
+	device: The device to perform computations on (CPU or GPU).
+	target_pid: The PID to filter by.
+	target_time: The time to filter by.
+	nprof: The number of profiles to plot (default is 5).
+	'''
+	model.eval()
+	count = 0
+	
+	with torch.no_grad():
+		for batch in dataloader:
+			# Filter by target PID
+			pid_mask = np.array([pid == target_pid for pid in batch['pid']])
+			if not np.any(pid_mask):
+				continue
+			
+			# Filter by target time
+			times = np.array(batch['time'])
+			time_mask = np.isclose(times, target_time, atol=1e-2)
+			mask = pid_mask & time_mask
+			
+			if not np.any(mask):
+				continue
+			
+			# Extract matching profiles
+			x = batch['profile'][mask].to(device)
+			recon = model(x).cpu().numpy()
+			originals = x.cpu().numpy()
+			matched_times = times[mask]
+
+			if len(matched_times) == 0:
+				print(f"No profiles found for PID: {target_pid} at Time: {target_time}")
+				continue
+		
+			# Plot up to nprof profiles
+			for i in range(min(np.sum(mask), nprof)):
+				fig = plt.figure(figsize=(14, 8))		
+				plt.plot(recon[i], label="Reconstructed", marker="x", color="orange")
+				plt.title(f"Reconstructed Profile - PID: {target_pid} | Time: {matched_times[i]:.2f}")
+				plt.legend()
+				plt.grid(True, alpha=0.3)
+				plt.tight_layout()
+				plt.show()
+				
 
 def compute_std_dev_latent(model, dataloader, device):
 	'''

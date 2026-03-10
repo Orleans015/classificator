@@ -175,6 +175,7 @@ class AnalysisWorker(QObject):
 
 def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
                  progress_cb=None):
+    import gc
     import torch
     from scipy.interpolate import make_smoothing_spline
 
@@ -196,23 +197,36 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
     model.eval()
 
     _p(f"Loading SXR data for PID {pid} …")
-    data, fpath, data_dict  = load_sxr_data(pid)
-    time_base               = data[0, :]
-    signals                 = data[1:, :]
-    max_emission            = int(np.argmax(data[152, :]))
-    time_instant            = float(time_base[max_emission])
-    profile                 = data[1:, max_emission].copy()
-    n_diodes                = len(profile)
-    x                       = np.arange(n_diodes)
+    data, fpath, data_dict = load_sxr_data(pid)
+
+    # Extract only what we need from data, then free the original array.
+    # Cast to float32 immediately to halve memory vs float64.
+    time_base    = data[0, :].astype(np.float32)
+    signals      = data[1:, :].astype(np.float32)       # owned float32 copy
+    diode_ref    = data[152, :].astype(np.float32)       # for correlation plot
+    del data
+    gc.collect()
+
+    # Store only the channel key names — not the full arrays — to avoid
+    # keeping a second copy of the entire dataset in memory.
+    diode_keys   = [k for k in data_dict.keys() if k != "time_base"]
+    del data_dict
+    gc.collect()
+
+    max_emission = int(np.argmax(diode_ref))
+    time_instant = float(time_base[max_emission])
+    profile      = signals[:, max_emission].copy()       # (n_diodes,)
+    n_diodes     = len(profile)
+    x            = np.arange(n_diodes)
 
     # ── original reconstruction ───────────────────────────────────────────────
     _p("Running model on original profile …")
     with torch.no_grad():
-        pn  = (profile - min_data) / (max_data - min_data)
-        pt  = torch.tensor(pn, dtype=torch.float32).unsqueeze(0)
-        rec = model(pt).squeeze(0).numpy()
+        pn  = ((profile - min_data) / (max_data - min_data)).astype(np.float32)
+        rec = model(torch.from_numpy(pn).unsqueeze(0)).squeeze(0).numpy()
     rec_original  = rec * (max_data - min_data) + min_data
     corr_original = float(np.corrcoef(profile, rec_original)[0, 1])
+    del pn, rec
 
     # ── iterative spline fit ──────────────────────────────────────────────────
     _p("Running iterative spline fit …")
@@ -232,59 +246,86 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
             best_spline = spline
             break
         mask = new_mask
-        sn   = (svals - min_data) / (max_data - min_data)
+        sn   = ((svals - min_data) / (max_data - min_data)).astype(np.float32)
         with torch.no_grad():
-            rt = model(torch.tensor(sn, dtype=torch.float32)
-                       .unsqueeze(0)).squeeze(0).numpy()
+            rt = model(torch.from_numpy(sn).unsqueeze(0)).squeeze(0).numpy()
         dn = rt * (max_data - min_data) + min_data
         if mask.sum() >= 2:
             c = float(np.corrcoef(profile[mask], dn[mask])[0, 1])
             if c > best_corr:
                 best_corr   = c
                 best_spline = spline
+        del sn, rt, dn
 
     if best_spline is None:
         best_spline = spline
+    del spline, svals, residuals
 
     spline_final = best_spline(x)
     outlier_mask = ~mask
 
-    # ── gain-corrected adjusted profiles ─────────────────────────────────────
+    # ── gain-corrected adjusted profile (single time instant) ─────────────────
     adjusted        = profile.copy()
-    adjusted_full   = signals.copy()
     adjusted[mask] *= gain_ratio
-    adjusted_full[mask, :] *= gain_ratio
 
     # ── reconstruction of adjusted profile ───────────────────────────────────
     _p("Running model on adjusted profile …")
     with torch.no_grad():
-        at = (adjusted - min_data) / (max_data - min_data)
-        at = torch.tensor(at, dtype=torch.float32).unsqueeze(0)
-        at = model(at).squeeze(0).numpy()
-    rec_adjusted  = at * (max_data - min_data) + min_data
+        an = ((adjusted - min_data) / (max_data - min_data)).astype(np.float32)
+        ar = model(torch.from_numpy(an).unsqueeze(0)).squeeze(0).numpy()
+    rec_adjusted  = ar * (max_data - min_data) + min_data
     corr_adjusted = float(np.corrcoef(adjusted, rec_adjusted)[0, 1])
+    del an, ar
 
-    # ── reconstruction of adjusted full time-series ──────────────────────────
-    _p("Running model on adjusted full time-series …")
-    with torch.no_grad():
-        at_full = (adjusted_full - min_data) / (max_data - min_data)
-        at_full = torch.tensor(at_full, dtype=torch.float32).T
-        at_full = model(at_full).squeeze(0).numpy()
-    rec_adjusted_full  = at_full * (max_data - min_data) + min_data
-
-    # ── correlation time-series ───────────────────────────────────────────────
+    # ── correlation time-series (batched, no full rec array kept) ─────────────
     _p("Computing correlation time-series …")
-    dn = (signals - min_data) / (max_data - min_data)
-    with torch.no_grad():
-        rec_all = model(torch.tensor(dn.T, dtype=torch.float32)).numpy().T
-    dn_all       = rec_all * (max_data - min_data) + min_data
-    # adding a decimation step here to speed up the correlation computation
-    step = max(10, len(time_base) // 500)
-    indices = np.arange(0, len(time_base), step)
-    correlations = np.array([
-        float(np.corrcoef(signals[:, i], dn_all[:, i])[0, 1])
-        for i in indices
-    ])
+    step    = max(10, len(time_base) // 500)
+    indices = np.arange(0, signals.shape[1], step)
+
+    # Process in batches: normalise, run model, denormalise, compute corr, discard.
+    batch_size   = 256
+    correlations = np.empty(len(indices), dtype=np.float32)
+    col          = 0
+    for start in range(0, len(indices), batch_size):
+        idx_batch  = indices[start : start + batch_size]
+        batch_sig  = signals[:, idx_batch]                        # (n_diodes, b)
+        batch_norm = ((batch_sig - min_data) / (max_data - min_data)
+                      ).astype(np.float32)
+        with torch.no_grad():
+            rec_batch = model(torch.from_numpy(batch_norm.T)       # (b, n_diodes)
+                              ).numpy()                             # (b, n_diodes)
+        rec_batch_dn = rec_batch * (max_data - min_data) + min_data
+        for j in range(len(idx_batch)):
+            correlations[col] = float(
+                np.corrcoef(batch_sig[:, j], rec_batch_dn[j, :])[0, 1]
+            )
+            col += 1
+        del batch_sig, batch_norm, rec_batch, rec_batch_dn
+
+    gc.collect()
+
+    # ── adjusted full time-series reconstruction (batched) ───────────────────
+    _p("Running model on adjusted full time-series …")
+
+    # Apply gain correction in-place on signals — signals becomes adjusted_full.
+    # This avoids creating a full extra copy of the array.
+    signals[mask, :] *= gain_ratio
+
+    n_time             = signals.shape[1]
+    rec_adjusted_full  = np.empty_like(signals)                    # (n_diodes, n_time)
+
+    for start in range(0, n_time, batch_size):
+        end        = min(start + batch_size, n_time)
+        batch      = ((signals[:, start:end] - min_data) /
+                      (max_data - min_data)).astype(np.float32)    # (n_diodes, b)
+        with torch.no_grad():
+            out    = model(torch.from_numpy(batch.T)).numpy()      # (b, n_diodes)
+        rec_adjusted_full[:, start:end] = (
+            out.T * (max_data - min_data) + min_data
+        )
+        del batch, out
+
+    gc.collect()
 
     _p("Done.")
     return dict(
@@ -292,21 +333,21 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
         time_instant      = time_instant,
         x                 = x,
         time_base         = time_base[indices],
+        time_base_full    = time_base,
         profile           = profile,
         rec_original      = rec_original,
         spline_final      = spline_final,
         outlier_mask      = outlier_mask,
+        mask              = mask,
         adjusted          = adjusted,
         rec_adjusted      = rec_adjusted,
-        adjusted_full     = adjusted_full,
-        time_base_full    = time_base,
-        rec_adjusted_full = rec_adjusted_full.T,
+        rec_adjusted_full = rec_adjusted_full,   # (n_diodes, n_time)
         corr_original     = corr_original,
         corr_adjusted     = corr_adjusted,
         correlations      = correlations,
-        diode_signal      = data[152, indices],
+        diode_signal      = diode_ref[indices],
         file_path         = fpath,
-        data_dict         = data_dict,
+        diode_keys        = diode_keys,          # list of strings only
     )
 
 
@@ -529,6 +570,13 @@ class WorkflowGUI(QMainWindow):
             QMessageBox.critical(self, "Parameter error", str(e))
             return
 
+        # ── clear previous results ────────────────────────────────────────────
+        import gc
+        self._results = None
+        self._save_btn.setEnabled(False)
+        gc.collect()
+        # ──────────────────────────────────────────────────────────────────────
+
         self._run_btn.setEnabled(False)
         self._run_btn.setText("⏳  Running …")
         self._status_lbl.setText("Starting …")
@@ -690,17 +738,14 @@ class WorkflowGUI(QMainWindow):
         r             = self._results
         h5py_path     = r["file_path"]
         pid           = r["pid"]
-        data_dict     = r["data_dict"]
         rec_adjusted_full = r["rec_adjusted_full"]  # (n_diodes, n_time)
-        # adjusted_full = r["adjusted_full"]   # (n_diodes, n_time)
-        time_base     = r["time_base_full"]
+        time_base         = r["time_base_full"]
+        diode_keys        = r["diode_keys"]
 
         # create a subdirectory alongside the original to keep things tidy
         save_dir = os.path.join(os.path.dirname(h5py_path.rstrip("/")),
                                 f"{pid}_adjusted")
         os.makedirs(save_dir, exist_ok=True)
-
-        diode_keys = [k for k in data_dict.keys() if k != "time_base"]
 
         try:
             for i, key in enumerate(diode_keys):
