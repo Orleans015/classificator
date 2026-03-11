@@ -137,6 +137,22 @@ QLabel#corr_bad {{ color: {DANGER};  font-weight: bold; }}
 QLabel#verdict_ok  {{ color: {SUCCESS}; font-size: 12px; font-weight: bold; }}
 QLabel#verdict_bad {{ color: {DANGER};  font-size: 12px; font-weight: bold; }}
 QLabel#status {{ color: {FG_DIM}; font-size: 9px; }}
+QPushButton#method_btn {{
+    background-color: {BORDER};
+    color: {FG_DIM};
+    border: 1px solid {BORDER};
+    border-radius: 3px;
+    padding: 4px 6px;
+    font-size: 9px;
+}}
+QPushButton#method_btn:checked {{
+    background-color: #1e3a5f;
+    color: {ACCENT};
+    border: 1px solid {ACCENT};
+}}
+QPushButton#method_btn:hover {{
+    background-color: #3a3d4a;
+}}
 """
 
 
@@ -149,19 +165,23 @@ class AnalysisWorker(QObject):
     finished = pyqtSignal(dict)
     error    = pyqtSignal(str)
 
-    def __init__(self, pid, model_path, min_data, max_data, gain_ratio):
+    def __init__(self, pid, model_path, min_data, max_data, gain_ratio,
+                 use_spline=True, z_thresh=2.0):
         super().__init__()
         self.pid        = pid
         self.model_path = model_path
         self.min_data   = min_data
         self.max_data   = max_data
         self.gain_ratio = gain_ratio
+        self.use_spline = use_spline
+        self.z_thresh   = z_thresh
 
     def run(self):
         try:
             results = run_analysis(
                 self.pid, self.model_path,
                 self.min_data, self.max_data, self.gain_ratio,
+                use_spline=self.use_spline, z_thresh=self.z_thresh,
                 progress_cb=self.progress.emit,
             )
             self.finished.emit(results)
@@ -197,7 +217,7 @@ def _fill_outlier_gaps(outlier_mask, profile, tol=0.10):
 
 
 def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
-                 progress_cb=None):
+                 use_spline=True, z_thresh=2.0, progress_cb=None):
     import gc
     import torch
     from scipy.interpolate import make_smoothing_spline
@@ -251,41 +271,55 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
     corr_original = float(np.corrcoef(profile, rec_original)[0, 1])
     del pn, rec
 
-    # ── iterative spline fit ──────────────────────────────────────────────────
-    _p("Running iterative spline fit …")
-    mask        = np.ones(n_diodes, dtype=bool)
-    best_spline = None
-    best_corr   = -1.0
+    # ── outlier detection — two methods ──────────────────────────────────────
+    if use_spline:
+        # ── iterative spline fit ──────────────────────────────────────────────
+        _p("Running iterative spline fit …")
+        mask        = np.ones(n_diodes, dtype=bool)
+        best_spline = None
+        best_corr   = -1.0
 
-    for _ in range(20):
-        spline    = make_smoothing_spline(x[mask], profile[mask])
-        svals     = spline(x)
-        residuals = profile - svals
-        pos       = residuals > 0
-        th        = (np.mean(residuals[pos]) #- 0.3 * np.std(residuals[pos])
-                     if np.any(pos) else 0.0)
-        new_mask  = ~((residuals > th) & (profile > svals))
-        if np.array_equal(mask, new_mask):
-            best_spline = spline
-            break
-        mask = new_mask
-        sn   = ((svals - min_data) / (max_data - min_data)).astype(np.float32)
-        with torch.no_grad():
-            rt = model(torch.from_numpy(sn).unsqueeze(0)).squeeze(0).numpy()
-        dn = rt * (max_data - min_data) + min_data
-        if mask.sum() >= 2:
-            c = float(np.corrcoef(profile[mask], dn[mask])[0, 1])
-            if c > best_corr:
-                best_corr   = c
+        for _ in range(20):
+            spline    = make_smoothing_spline(x[mask], profile[mask])
+            svals     = spline(x)
+            residuals = profile - svals
+            pos       = residuals > 0
+            th        = (np.mean(residuals[pos]) #- 0.3 * np.std(residuals[pos])
+                         if np.any(pos) else 0.0)
+            new_mask  = ~((residuals > th) & (profile > svals))
+            if np.array_equal(mask, new_mask):
                 best_spline = spline
-        del sn, rt, dn
+                break
+            mask = new_mask
+            sn   = ((svals - min_data) / (max_data - min_data)).astype(np.float32)
+            with torch.no_grad():
+                rt = model(torch.from_numpy(sn).unsqueeze(0)).squeeze(0).numpy()
+            dn = rt * (max_data - min_data) + min_data
+            if mask.sum() >= 2:
+                c = float(np.corrcoef(profile[mask], dn[mask])[0, 1])
+                if c > best_corr:
+                    best_corr   = c
+                    best_spline = spline
+            del sn, rt, dn
 
-    if best_spline is None:
-        best_spline = spline
-    del spline, svals, residuals
+        if best_spline is None:
+            best_spline = spline
+        del spline, svals, residuals
 
-    spline_final = best_spline(x)
-    outlier_mask = ~mask
+        spline_final = best_spline(x)
+        outlier_mask = ~mask
+
+    else:
+        # ── model residual method ─────────────────────────────────────────────
+        _p("Detecting outliers via model residuals …")
+        residuals    = profile - rec_original   # rec_original already computed above
+        mean_res     = np.mean(residuals)
+        std_res      = np.std(residuals)
+        outlier_mask = residuals > (mean_res + z_thresh * std_res)
+        mask         = ~outlier_mask
+        # use the AE reconstruction as the reference curve for the plot
+        spline_final = rec_original
+        del residuals
 
     # ── filling gaps between consecutive outliers (if needed) ─────────────────
     outlier_mask = _fill_outlier_gaps(outlier_mask, profile, tol=0.1)
@@ -382,6 +416,7 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
         diode_signal      = diode_ref[indices],
         file_path         = fpath,
         diode_keys        = diode_keys,          # list of strings only
+        use_spline        = use_spline,
     )
 
 
@@ -521,6 +556,26 @@ class WorkflowGUI(QMainWindow):
             gain_h.addWidget(e)
         lay.addWidget(gain_row)
 
+        # Outlier detection method
+        section("OUTLIER DETECTION")
+        method_row = QWidget()
+        method_h   = QHBoxLayout(method_row)
+        method_h.setContentsMargins(0, 0, 0, 0)
+        method_h.setSpacing(4)
+        self._method_spline = QPushButton("Spline fit")
+        self._method_resid  = QPushButton("Model residuals")
+        for btn in (self._method_spline, self._method_resid):
+            btn.setObjectName("method_btn")
+            btn.setCheckable(True)
+            method_h.addWidget(btn)
+        self._method_spline.setChecked(True)
+        self._method_spline.clicked.connect(
+            lambda: self._method_resid.setChecked(False))
+        self._method_resid.clicked.connect(
+            lambda: self._method_spline.setChecked(False))
+        lay.addWidget(method_row)
+        self._z_edit = field("Z-threshold (residuals only)", "2.0")
+
         # spacer + run button
         lay.addStretch()
         self._run_btn = QPushButton("▶  RUN ANALYSIS")
@@ -611,13 +666,21 @@ class WorkflowGUI(QMainWindow):
         gc.collect()
         # ──────────────────────────────────────────────────────────────────────
 
+        use_spline = self._method_spline.isChecked()
+        try:
+            z_thresh = float(self._z_edit.text())
+        except ValueError:
+            z_thresh = 2.0
+
         self._run_btn.setEnabled(False)
         self._run_btn.setText("⏳  Running …")
         self._status_lbl.setText("Starting …")
 
         self._thread = QThread()
         self._worker = AnalysisWorker(pid, model_path, min_data,
-                                      max_data, gain_ratio)
+                                      max_data, gain_ratio,
+                                      use_spline=use_spline,
+                                      z_thresh=z_thresh)
         self._worker.moveToThread(self._thread)
 
         self._thread.started.connect(self._worker.run)
@@ -677,17 +740,19 @@ class WorkflowGUI(QMainWindow):
         # panel 2 — adjusted profile with outliers
         ax  = self._ax_adj
         out = r["outlier_mask"]
+        ref_label = "Spline fit" if r["use_spline"] else "AE reconstruction"
         ax.plot(x, r["profile"],      color=FG_DIM,  lw=1.2, ls="--",
                 alpha=0.6, label="Original")
         ax.plot(x, r["adjusted"],     color=ACCENT3, lw=1.8,
                 label="Adjusted")
         ax.plot(x, r["spline_final"], color=ACCENT2, lw=1.2, ls=":",
-                alpha=0.7, label="Spline fit")
+                alpha=0.7, label=ref_label)
         if out.any():
             ax.scatter(x[out], r["profile"][out],
                         color=ACCENT4, marker="x", s=80, lw=1.8,
                         label=f"Outliers ({out.sum()})", zorder=5)
-        ax.set_title("Adjusted Profile  (gain correction)", color=FG, pad=8)
+        method_label = "Spline fit" if r["use_spline"] else "Model residuals"
+        ax.set_title(f"Adjusted Profile  [{method_label}]", color=FG, pad=8)
         ax.set_xlabel("Diode index")
         ax.set_ylabel("Signal [V]")
         ax.legend(fontsize=8)
