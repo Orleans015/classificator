@@ -172,6 +172,29 @@ class AnalysisWorker(QObject):
 # ─────────────────────────────────────────────────────────────────────────────
 #  Core computation 
 # ─────────────────────────────────────────────────────────────────────────────
+def _fill_outlier_gaps(outlier_mask, profile, tol=0.10):
+    """
+    For each pair of consecutive outliers at indices i and j, inspect every
+    point m between them. If profile[m] falls within `tol` (relative) of the
+    average of the two bounding outlier values, flag m as an outlier too.
+    """
+    filled          = outlier_mask.copy()
+    outlier_indices = np.where(outlier_mask)[0]
+
+    for k in range(len(outlier_indices) - 1):
+        i   = outlier_indices[k]
+        j   = outlier_indices[k + 1]
+
+        if j - i > 8: # This function should check only in the same camera
+            continue
+
+        ref = (profile[i] + profile[j]) / 2.0
+        for m in range(i + 1, j):
+            if abs(profile[m] - ref) / (abs(ref) + 1e-10) <= tol:
+                filled[m] = True
+
+    return filled
+
 
 def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
                  progress_cb=None):
@@ -239,7 +262,7 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
         svals     = spline(x)
         residuals = profile - svals
         pos       = residuals > 0
-        th        = (np.mean(residuals[pos]) - 0.3 * np.std(residuals[pos])
+        th        = (np.mean(residuals[pos]) #- 0.3 * np.std(residuals[pos])
                      if np.any(pos) else 0.0)
         new_mask  = ~((residuals > th) & (profile > svals))
         if np.array_equal(mask, new_mask):
@@ -264,9 +287,17 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
     spline_final = best_spline(x)
     outlier_mask = ~mask
 
+    # ── filling gaps between consecutive outliers (if needed) ─────────────────
+    outlier_mask = _fill_outlier_gaps(outlier_mask, profile, tol=0.1)
+    mask         = ~outlier_mask # keep mask consistent with outlier_mask
+
     # ── gain-corrected adjusted profile (single time instant) ─────────────────
     adjusted        = profile.copy()
-    adjusted[mask] *= gain_ratio
+    if gain_ratio > 1:
+        adjusted[mask] *= gain_ratio # non-outliers are the real outliers
+    else:
+        adjusted[outlier_mask] *= gain_ratio # scale the outliers
+
 
     # ── reconstruction of adjusted profile ───────────────────────────────────
     _p("Running model on adjusted profile …")
@@ -309,7 +340,10 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
 
     # Apply gain correction in-place on signals — signals becomes adjusted_full.
     # This avoids creating a full extra copy of the array.
-    signals[mask, :] *= gain_ratio
+    if gain_ratio > 1:
+        signals[mask, :] *= gain_ratio
+    else:
+        signals[outlier_mask, :] *= gain_ratio
 
     n_time             = signals.shape[1]
     rec_adjusted_full  = np.empty_like(signals)                    # (n_diodes, n_time)
@@ -643,34 +677,33 @@ class WorkflowGUI(QMainWindow):
         # panel 2 — adjusted profile with outliers
         ax  = self._ax_adj
         out = r["outlier_mask"]
-        if out.any() and r["corr_original"] < 0.9:
-            ax.plot(x, r["profile"],      color=FG_DIM,  lw=1.2, ls="--",
-                    alpha=0.6, label="Original")
-            ax.plot(x, r["adjusted"],     color=ACCENT3, lw=1.8,
-                    label="Adjusted")
-            ax.plot(x, r["spline_final"], color=ACCENT2, lw=1.2, ls=":",
-                    alpha=0.7, label="Spline fit")
+        ax.plot(x, r["profile"],      color=FG_DIM,  lw=1.2, ls="--",
+                alpha=0.6, label="Original")
+        ax.plot(x, r["adjusted"],     color=ACCENT3, lw=1.8,
+                label="Adjusted")
+        ax.plot(x, r["spline_final"], color=ACCENT2, lw=1.2, ls=":",
+                alpha=0.7, label="Spline fit")
+        if out.any():
             ax.scatter(x[out], r["profile"][out],
                         color=ACCENT4, marker="x", s=80, lw=1.8,
                         label=f"Outliers ({out.sum()})", zorder=5)
-            ax.set_title("Adjusted Profile  (gain correction)", color=FG, pad=8)
-            ax.set_xlabel("Diode index")
-            ax.set_ylabel("Signal [V]")
-            ax.legend(fontsize=8)
+        ax.set_title("Adjusted Profile  (gain correction)", color=FG, pad=8)
+        ax.set_xlabel("Diode index")
+        ax.set_ylabel("Signal [V]")
+        ax.legend(fontsize=8)
 
         # panel 3 — adjusted + AE reconstruction
         ax = self._ax_rec
-        if r["outlier_mask"].any() and r["corr_original"] < 0.9:
-            ax.plot(x, r["profile"],      color=FG_DIM,  lw=1.2, ls="--",
-                    alpha=0.6, label="Original")
-            ax.plot(x, r["adjusted"],     color=ACCENT3, lw=1.8,
-                    label="Adjusted")
-            ax.plot(x, r["rec_adjusted"], color=ACCENT2, lw=1.8, ls="--",
-                    label=f"AE recon (adj)  (ρ = {r['corr_adjusted']:.4f})")
-            ax.set_title("Adjusted  vs  AE Reconstruction", color=FG, pad=8)
-            ax.set_xlabel("Diode index")
-            ax.set_ylabel("Signal [V]")
-            ax.legend(fontsize=8)
+        ax.plot(x, r["profile"],      color=FG_DIM,  lw=1.2, ls="--",
+                alpha=0.6, label="Original")
+        ax.plot(x, r["adjusted"],     color=ACCENT3, lw=1.8,
+                label="Adjusted")
+        ax.plot(x, r["rec_adjusted"], color=ACCENT2, lw=1.8, ls="--",
+                label=f"AE recon (adj)  (ρ = {r['corr_adjusted']:.4f})")
+        ax.set_title("Adjusted  vs  AE Reconstruction", color=FG, pad=8)
+        ax.set_xlabel("Diode index")
+        ax.set_ylabel("Signal [V]")
+        ax.legend(fontsize=8)
 
         # panel 4 — correlation over time
         ax  = self._ax_corr
