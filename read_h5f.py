@@ -17,7 +17,7 @@ def format_pid(pid: str) -> str:
     return pid.replace('.', '_')
 
 
-def read_h5f_directory(h5py_path: str) -> dict:
+def read_h5f_directory(h5py_path: str, decimate: int = 100) -> dict:
     """
     Read all .h5f files in the given directory and return a dictionary of datasets.
 
@@ -29,6 +29,8 @@ def read_h5f_directory(h5py_path: str) -> dict:
     ----------
     h5py_path : str
         Path to the directory containing the .h5f files.
+    decimate  : int
+        Takes data every n = decimate entries
 
     Returns
     -------
@@ -38,8 +40,21 @@ def read_h5f_directory(h5py_path: str) -> dict:
     """
     REFERENCE_SUFFIXES = ("_t000.h5f", "_t090.h5f", "_t180.h5f", "_t270.h5f")
     data_dict = {}
+    length = np.inf
 
+    # Check if the data has consistent length, otherwise cut it to the smallest length
     for f in os.listdir(h5py_path):
+        h5f_file = os.path.join(h5py_path, f)
+        if f.endswith(".h5f"):
+            with h5py.File(h5f_file, "r") as h5f:
+                if "XMCTSdata" in h5f:
+                    for dataset in h5f["XMCTSdata"].keys():
+                        if dataset != "timedata":
+                            length_tmp = h5f["XMCTSdata"][dataset][:].shape[0]
+                            if length_tmp < length:
+                                length = length_tmp
+
+    for f in sorted(os.listdir(h5py_path)):
         h5f_file = os.path.join(h5py_path, f)
 
         # Reference files: extract time base only
@@ -47,8 +62,8 @@ def read_h5f_directory(h5py_path: str) -> dict:
             with h5py.File(h5f_file, "r") as h5f:
                 if "XMCTSdata" in h5f:
                     for dataset in h5f["XMCTSdata"].keys():
-                        if dataset.endswith("0"):
-                            data_dict["time_base"] = h5f["XMCTSdata"][dataset][:]
+                        if dataset.endswith("000"):
+                            data_dict["time_base"] = h5f["XMCTSdata"][dataset][:length:decimate]
             continue
 
         # Data files: extract all datasets except 'timedata'
@@ -57,7 +72,7 @@ def read_h5f_directory(h5py_path: str) -> dict:
                 if "XMCTSdata" in h5f:
                     for dataset in h5f["XMCTSdata"].keys():
                         if dataset != "timedata":
-                            data_dict[dataset] = h5f["XMCTSdata"][dataset][:]
+                            data_dict[dataset] = h5f["XMCTSdata"][dataset][:length:decimate]
 
     return data_dict
 
@@ -82,7 +97,31 @@ def build_data_array(data_dict: dict) -> np.ndarray:
     return np.array(list(data_dict.values()))
 
 
-def load_sxr_data(pid: str, base_path: str = "/home/IPP-HGW/orluca/devel/data/HDF/_data") -> np.ndarray:
+
+def sort_sxr_data(data: np.ndarray) -> np.ndarray:
+    """
+    Organize the stacked arrays so that the time base is sorted.
+    
+    Parameters
+    ----------
+    data : np.ndarray
+        array returned by build_data_array()
+        
+    Returns
+    -------
+    np.ndarray
+        Sorted 2D array of shape (n_channels, n_timepoints).
+    """
+    sorted_indices = np.argsort(data[:, 0])
+    return data[sorted_indices, :]
+
+
+def get_sxr_data():
+    raise NotImplementedError
+
+
+def load_sxr_data(pid: str, base_path: str = "/home/IPP-HGW/orluca/devel/data/HDF/_data/OP2",
+                  decimate: int = 1) -> np.ndarray:
     """
     Full pipeline: given a program ID, load all SXR diode data and return
     a 2D numpy array of shape (n_channels, n_timepoints).
@@ -101,13 +140,13 @@ def load_sxr_data(pid: str, base_path: str = "/home/IPP-HGW/orluca/devel/data/HD
     """
     pid_formatted = format_pid(pid)
     h5py_path = os.path.join(base_path, pid_formatted, "")
-    data_dict = read_h5f_directory(h5py_path)
+    data_dict = read_h5f_directory(h5py_path, decimate)
     data = build_data_array(data_dict)
     return data, h5py_path, data_dict
 
 
 if __name__ == "__main__":
-    pid = "20250305.50"
+    pid = "20221019.25"
     data, h5py_path, data_dict = load_sxr_data(pid)
     print(f"Loaded data array with shape: {data.shape}")
     print(f"H5F path: {h5py_path}")

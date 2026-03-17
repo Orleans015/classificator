@@ -9,8 +9,21 @@ Requirements:
     pip install PyQt6 matplotlib numpy scipy torch
 """
 
+import os
 import sys
 import numpy as np
+
+# This is a really bad way of doing this!! 
+root = "/home/IPP-HGW/orluca/devel/qxtdataaccesspython"
+for dirpath, dirnames, filenames in os.walk(root):
+    if any(f.endswith(".py") for f in filenames):
+        if dirpath not in sys.path:
+            sys.path.append(dirpath)
+
+from qxt_archive_lib import tget_qxt_data
+from archive_access import timeID
+
+from read_h5f import format_pid
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -240,7 +253,29 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
     model.eval()
 
     _p(f"Loading SXR data for PID {pid} …")
-    data, fpath, data_dict = load_sxr_data(pid)
+    try:
+        data, fpath, data_dict = load_sxr_data(pid)
+    except:
+        _p(f"Data for PID {pid} not found in memory, reading archive…")
+        dir_name = format_pid(pid) + "/"
+        save_path = os.path.join("/home/IPP-HGW/orluca/devel/data/HDF/_dataOP2/", str(dir_name))
+        os.makedirs(save_path, exist_ok=True)
+        pdata = timeID()
+        pdata.init_pid(pid)
+        pdata.set_from_upto()
+        for diode in np.arange(360):
+            _ = tget_qxt_data(
+                pdata,
+                diode,
+                nreduce   = None,
+                lstep     = 1,
+                average   = 0,
+                save_hdf  = True,
+                fpath_hdf = save_path,
+                quiet     = True,
+                debug     = False,
+            )
+        data, fpath, data_dict = load_sxr_data(pid)
 
     # Extract only what we need from data, then free the original array.
     # Cast to float32 immediately to halve memory vs float64.
@@ -574,7 +609,7 @@ class WorkflowGUI(QMainWindow):
         self._method_resid.clicked.connect(
             lambda: self._method_spline.setChecked(False))
         lay.addWidget(method_row)
-        self._z_edit = field("Z-threshold (residuals only)", "2.0")
+        self._z_edit = field("Z-threshold (residuals only)", "0.2")
 
         # spacer + run button
         lay.addStretch()
