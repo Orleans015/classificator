@@ -174,7 +174,7 @@ class AnalysisWorker(QObject):
     error    = pyqtSignal(str)
 
     def __init__(self, pid, model_path, min_data, max_data, gain_ratio,
-                 use_spline=True, z_thresh=2.0):
+                 use_spline=True, z_thresh=0.2):
         super().__init__()
         self.pid        = pid
         self.model_path = model_path
@@ -225,7 +225,7 @@ def _fill_outlier_gaps(outlier_mask, profile, tol=0.10):
 
 
 def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
-                 use_spline=True, z_thresh=2.0, progress_cb=None):
+                 use_spline=True, z_thresh=0.2, progress_cb=None):
     import gc
     import torch
     from scipy.interpolate import make_smoothing_spline
@@ -596,7 +596,7 @@ class WorkflowGUI(QMainWindow):
         self._method_resid.clicked.connect(
             lambda: self._method_spline.setChecked(False))
         lay.addWidget(method_row)
-        self._z_edit = field("Z-threshold (residuals only)", "2.0")
+        self._z_edit = field("Z-threshold (residuals only)", "0.2")
 
         # spacer + run button
         lay.addStretch()
@@ -692,7 +692,7 @@ class WorkflowGUI(QMainWindow):
         try:
             z_thresh = float(self._z_edit.text())
         except ValueError:
-            z_thresh = 2.0
+            z_thresh = 0.2
 
         self._run_btn.setEnabled(False)
         self._run_btn.setText("⏳  Running …")
