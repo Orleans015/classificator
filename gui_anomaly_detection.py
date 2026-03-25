@@ -23,7 +23,7 @@ for dirpath, dirnames, filenames in os.walk(root):
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QFileDialog, QMessageBox,
-    QFrame, QSizePolicy, QGridLayout
+    QFrame, QSizePolicy, QGridLayout, QDialog, QComboBox,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
 
@@ -33,6 +33,9 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
+
+from scipy.signal import welch
+from scipy.stats  import entropy as scipy_entropy
 
 # ── colour palette ────────────────────────────────────────────────────────────
 BG      = "#0f1117"
@@ -161,6 +164,35 @@ QPushButton#method_btn:checked {{
 QPushButton#method_btn:hover {{
     background-color: #3a3d4a;
 }}
+QPushButton#spectral {{
+    background-color: #1a2e1a;
+    color: {ACCENT3};
+    font-weight: bold;
+    font-size: 11px;
+    border: 1px solid {ACCENT3};
+    border-radius: 4px;
+    padding: 9px;
+}}
+QPushButton#spectral:hover {{
+    background-color: #253525;
+}}
+QPushButton#spectral:disabled {{
+    background-color: #1a1d27;
+    color: {FG_DIM};
+    border: 1px solid {BORDER};
+}}
+QComboBox {{
+    background-color: #252836;
+    color: {FG};
+    border: 1px solid {BORDER};
+    border-radius: 3px;
+    padding: 2px 4px;
+}}
+QComboBox QAbstractItemView {{
+    background-color: #252836;
+    color: {FG};
+    selection-background-color: {ACCENT};
+}}
 """
 
 
@@ -249,7 +281,7 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
 
     _p(f"Loading SXR data for PID {pid} …")
     try:
-        data, fpath, data_dict = load_sxr_data(pid)
+        data, fpath, data_dict = load_sxr_data(pid, decimate=100)
     except:
         _p(f"Data for PID {pid} not found in memory, launching data access gui!")
         try:
@@ -391,6 +423,12 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
 
     gc.collect()
 
+    # ── snapshot for spectral analysis (BEFORE in-place gain correction) ──────
+    # Keep a downsampled copy of the original signals so SpectralAnalysisDialog
+    # can compute per-diode PSDs without holding the full array.
+    _p("Saving signals snapshot for spectral analysis …")
+    signals_sampled = signals[:, indices].copy()               # (n_diodes, n_sampled)
+
     # ── adjusted full time-series reconstruction (batched) ───────────────────
     _p("Running model on adjusted full time-series …")
 
@@ -439,6 +477,7 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
         file_path         = fpath,
         diode_keys        = diode_keys,          # list of strings only
         use_spline        = use_spline,
+        signals_sampled   = signals_sampled,     # (n_diodes, n_sampled) — for spectral
     )
 
 
@@ -460,6 +499,294 @@ def _divider():
 def _entry(default=""):
     e = QLineEdit(default)
     return e
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Spectral Analysis Dialog
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SpectralAnalysisDialog(QDialog):
+    """
+    Stand-alone spectral analysis window.
+
+    Three panels (all sharing the same diode-index x-axis so anomalies line up):
+      • Top    — 2-D power spectral density heatmap  (diode × frequency, log scale)
+                 The dominant frequency per diode is overlaid as a dashed line.
+      • Middle — total spectral power per diode
+      • Bottom — spectral entropy per diode
+                 (high = noise-like / white;  low = tonal / coherent signal)
+
+    Outlier diodes from the parent analysis are highlighted with translucent red
+    bands in every panel so you can immediately compare spectral signatures with
+    the spatial anomaly locations.
+
+    Controls (toolbar row):
+      • Window function  — hann / hamming / blackman / boxcar
+      • nperseg          — 64 / 128 / 256 / 512
+      • f-max            — clip the frequency axis for better visibility
+      • Colormap         — choose heatmap palette
+    """
+
+    def __init__(self, results: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Spectral Analysis — PID {results['pid']}")
+        self.resize(1240, 860)
+        self.setMinimumSize(900, 600)
+        self.setStyleSheet(STYLESHEET)
+        self._r = results
+        self._build_ui()
+        self._compute_and_plot()
+
+    # ── layout ────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(6)
+
+        # ── toolbar row ───────────────────────────────────────────────────────
+        ctrl = QWidget()
+        ctrl.setStyleSheet(
+            f"background:{PANEL}; border-radius:4px;"
+            f" border: 1px solid {BORDER}; padding: 2px;"
+        )
+        ctrl_h = QHBoxLayout(ctrl)
+        ctrl_h.setContentsMargins(12, 6, 12, 6)
+        ctrl_h.setSpacing(14)
+
+        def _combo(items, width=90, default_idx=0):
+            c = QComboBox()
+            c.addItems(items)
+            c.setCurrentIndex(default_idx)
+            c.setFixedWidth(width)
+            c.currentIndexChanged.connect(self._replot)
+            return c
+
+        ctrl_h.addWidget(_lbl("Window:", "dim"))
+        self._win_combo     = _combo(["hann", "hamming", "blackman", "boxcar"])
+        ctrl_h.addWidget(self._win_combo)
+
+        ctrl_h.addWidget(_lbl("nperseg:", "dim"))
+        self._nperseg_combo = _combo(["64", "128", "256", "512"],
+                                     width=70, default_idx=2)
+        ctrl_h.addWidget(self._nperseg_combo)
+
+        ctrl_h.addWidget(_lbl("f-max (Hz):", "dim"))
+        self._fmax_combo    = _combo(
+            ["All", "50", "100", "200", "500", "1 000", "2 000", "5 000"],
+            width=80,
+        )
+        ctrl_h.addWidget(self._fmax_combo)
+
+        ctrl_h.addWidget(_lbl("Colormap:", "dim"))
+        self._cmap_combo    = _combo(
+            ["inferno", "magma", "plasma", "viridis", "cividis", "hot"],
+            width=80,
+        )
+        ctrl_h.addWidget(self._cmap_combo)
+
+        ctrl_h.addStretch()
+        self._info_lbl = _lbl("", "dim")
+        ctrl_h.addWidget(self._info_lbl)
+        root.addWidget(ctrl)
+
+        # ── matplotlib canvas ─────────────────────────────────────────────────
+        self._fig = Figure(figsize=(11, 8), dpi=100, facecolor=BG)
+        canvas    = FigureCanvasQTAgg(self._fig)
+        canvas.setSizePolicy(QSizePolicy.Policy.Expanding,
+                             QSizePolicy.Policy.Expanding)
+        root.addWidget(canvas, stretch=1)
+
+        tb_w = QWidget()
+        tb_w.setStyleSheet(f"background:{PANEL};")
+        tb_h = QHBoxLayout(tb_w)
+        tb_h.setContentsMargins(4, 0, 4, 0)
+        toolbar = NavigationToolbar2QT(canvas, tb_w)
+        toolbar.setStyleSheet(f"background:{PANEL}; color:{FG};")
+        tb_h.addWidget(toolbar)
+        root.addWidget(tb_w)
+
+        self._canvas = canvas
+
+    # ── spectral computation ──────────────────────────────────────────────────
+
+    def _compute_psd_matrix(self, nperseg: int, window: str):
+        """
+        Return (freqs, psd_matrix, fs_est) where psd_matrix has shape
+        (n_diodes, n_freqs).  Uses the downsampled signals snapshot so
+        the computation is fast even for large n_time.
+        """
+        r         = self._r
+        sigs      = r["signals_sampled"]          # (n_diodes, n_sampled)
+        time_base = r["time_base"]                # (n_sampled,)  in ms
+
+        # Estimate sampling frequency from the (possibly irregular) time base.
+        # time_base is in ms → convert to seconds for Hz.
+        dt_ms  = float(np.median(np.diff(time_base)))
+        fs_est = 1.0 / (dt_ms * 1e-3)             # Hz
+
+        n_diodes  = sigs.shape[0]
+        freqs, _  = welch(sigs[0], fs=fs_est, nperseg=nperseg, window=window)
+        n_freqs   = len(freqs)
+
+        psd_matrix = np.empty((n_diodes, n_freqs), dtype=np.float32)
+        for i in range(n_diodes):
+            _, p = welch(sigs[i].astype(np.float64),
+                         fs=fs_est, nperseg=nperseg, window=window)
+            psd_matrix[i] = p.astype(np.float32)
+
+        return freqs, psd_matrix, fs_est
+
+    # ── re-draw ───────────────────────────────────────────────────────────────
+
+    def _compute_and_plot(self):
+        nperseg = int(self._nperseg_combo.currentText())
+        window  = self._win_combo.currentText()
+        self._freqs, self._psd, self._fs = self._compute_psd_matrix(nperseg, window)
+        self._draw()
+
+    def _replot(self):
+        self._compute_and_plot()
+
+    def _draw(self):
+        r            = self._r
+        freqs        = self._freqs
+        psd          = self._psd                  # (n_diodes, n_freqs)
+        outlier_mask = r["outlier_mask"]           # (n_diodes,)
+        n_diodes     = psd.shape[0]
+        x            = np.arange(n_diodes)
+        cmap         = self._cmap_combo.currentText()
+
+        # ── frequency axis truncation ─────────────────────────────────────────
+        fmax_txt = self._fmax_combo.currentText().replace(" ", "")
+        if fmax_txt == "All":
+            freq_mask = np.ones(len(freqs), dtype=bool)
+        else:
+            freq_mask = freqs <= float(fmax_txt)
+        freqs_plt = freqs[freq_mask]
+        psd_plt   = psd[:, freq_mask]              # (n_diodes, n_freqs_clipped)
+
+        # ── derived per-diode metrics ─────────────────────────────────────────
+        total_power = psd_plt.sum(axis=1)
+
+        # Spectral entropy: H = -Σ p·log(p) on the normalised PSD
+        # High entropy  → noise-like (flat spectrum)
+        # Low entropy   → tonal (energy concentrated in a few bins)
+        spec_entropy = np.array([
+            float(scipy_entropy(
+                psd_plt[i] / (psd_plt[i].sum() + 1e-30)
+            ))
+            for i in range(n_diodes)
+        ], dtype=np.float32)
+
+        # Dominant frequency per diode
+        dom_freq = freqs_plt[np.argmax(psd_plt, axis=1)]
+
+        # ── figure layout ─────────────────────────────────────────────────────
+        self._fig.clf()
+        gs = gridspec.GridSpec(
+            3, 2, figure=self._fig,
+            height_ratios=[3, 1, 1],
+            width_ratios=[30, 1],
+            hspace=0.52, wspace=0.03,
+            left=0.07, right=0.95,
+            top=0.93, bottom=0.07,
+        )
+        ax_heat  = self._fig.add_subplot(gs[0, 0])
+        ax_cbar  = self._fig.add_subplot(gs[0, 1])
+        ax_power = self._fig.add_subplot(gs[1, 0])
+        ax_entr  = self._fig.add_subplot(gs[2, 0])
+
+        for ax in (ax_heat, ax_power, ax_entr):
+            ax.set_facecolor(PANEL)
+            ax.grid(True, alpha=0.35)
+
+        pid          = r["pid"]
+        nperseg_used = int(self._nperseg_combo.currentText())
+        win_used     = self._win_combo.currentText()
+        self._fig.suptitle(
+            f"Spectral Analysis — PID: {pid}   |   "
+            f"window = {win_used}   nperseg = {nperseg_used}   "
+            f"fs ≈ {self._fs:.0f} Hz",
+            color=FG, fontsize=10, y=0.985,
+        )
+
+        # ── heatmap (diode × frequency, log₁₀ power) ─────────────────────────
+        log_psd = np.log10(psd_plt.T + 1e-30)     # (n_freqs, n_diodes)
+
+        im = ax_heat.imshow(
+            log_psd,
+            aspect="auto",
+            origin="lower",
+            extent=[-0.5, n_diodes - 0.5, freqs_plt[0], freqs_plt[-1]],
+            cmap=cmap,
+            interpolation="nearest",
+        )
+        # dominant frequency as dashed overlay
+        ax_heat.plot(x, dom_freq, color=ACCENT3, lw=1.2, ls="--",
+                     alpha=0.80, label="Dominant freq / diode")
+        ax_heat.set_ylabel("Frequency  (Hz)", color=FG)
+        ax_heat.set_title(
+            "Power Spectral Density   [log₁₀(V²/Hz)]   —   "
+            "each column is one diode's spectrum",
+            color=FG, pad=6, fontsize=9,
+        )
+        ax_heat.tick_params(labelbottom=False)
+        ax_heat.legend(fontsize=7, loc="upper right")
+
+        cb = self._fig.colorbar(im, cax=ax_cbar)
+        cb.set_label("log₁₀ PSD", color=FG, fontsize=8)
+        cb.ax.yaxis.set_tick_params(color=FG_DIM, labelsize=7)
+        plt.setp(cb.ax.yaxis.get_ticklabels(), color=FG_DIM)
+
+        # ── total spectral power per diode ────────────────────────────────────
+        ax_power.fill_between(x, total_power, alpha=0.20, color=ACCENT)
+        ax_power.plot(x, total_power, color=ACCENT, lw=1.5,
+                      label="Total spectral power")
+        ax_power.set_ylabel("Total power\n(V²/Hz)", color=FG, fontsize=8)
+        ax_power.tick_params(labelbottom=False)
+
+        # ── spectral entropy per diode ────────────────────────────────────────
+        ax_entr.fill_between(x, spec_entropy, alpha=0.20, color=ACCENT2)
+        ax_entr.plot(x, spec_entropy, color=ACCENT2, lw=1.5,
+                     label="Spectral entropy")
+        ax_entr.set_ylabel("Entropy\n(nats)", color=FG, fontsize=8)
+        ax_entr.set_xlabel("Diode index", color=FG)
+
+        # ── outlier bands and scatter markers on all panels ───────────────────
+        if outlier_mask.any():
+            out_idx = np.where(outlier_mask)[0]
+
+            for ax in (ax_heat, ax_power, ax_entr):
+                for idx in out_idx:
+                    ax.axvspan(idx - 0.5, idx + 0.5,
+                               color=ACCENT4, alpha=0.22, linewidth=0, zorder=0)
+
+            ax_power.scatter(
+                out_idx, total_power[out_idx],
+                color=ACCENT4, s=50, zorder=6, label=f"Outliers ({len(out_idx)})",
+            )
+            ax_entr.scatter(
+                out_idx, spec_entropy[out_idx],
+                color=ACCENT4, s=50, zorder=6, label=f"Outliers ({len(out_idx)})",
+            )
+
+        # Add legend entries including outlier label even when there are none
+        for ax in (ax_power, ax_entr):
+            ax.legend(fontsize=7, loc="upper right")
+
+        # x-axis sync
+        for ax in (ax_heat, ax_power, ax_entr):
+            ax.set_xlim(-0.5, n_diodes - 0.5)
+
+        # ── status line ───────────────────────────────────────────────────────
+        n_out = int(outlier_mask.sum())
+        self._info_lbl.setText(
+            f"{n_diodes} diodes  |  {n_out} flagged outliers  |  "
+            f"{len(freqs_plt)} freq bins  |  fs ≈ {self._fs:.0f} Hz"
+        )
+
+        self._canvas.draw_idle()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -598,17 +925,30 @@ class WorkflowGUI(QMainWindow):
         lay.addWidget(method_row)
         self._z_edit = field("Z-threshold (residuals only)", "0.2")
 
-        # spacer + run button
+        # spacer + action buttons
         lay.addStretch()
+
         self._run_btn = QPushButton("▶  RUN ANALYSIS")
         self._run_btn.setObjectName("run")
         self._run_btn.clicked.connect(self._run)
         lay.addWidget(self._run_btn)
+
         self._save_btn = QPushButton("💾  SAVE ADJUSTED DATA")
         self._save_btn.setObjectName("run")
         self._save_btn.setEnabled(False)
         self._save_btn.clicked.connect(self._save_adjusted_data)
         lay.addWidget(self._save_btn)
+
+        # ── NEW: spectral analysis button ─────────────────────────────────────
+        self._spectral_btn = QPushButton("📊  SPECTRAL ANALYSIS")
+        self._spectral_btn.setObjectName("spectral")
+        self._spectral_btn.setEnabled(False)
+        self._spectral_btn.setToolTip(
+            "Open per-diode PSD heatmap, total power, and spectral entropy plots"
+        )
+        self._spectral_btn.clicked.connect(self._open_spectral_analysis)
+        lay.addWidget(self._spectral_btn)
+        # ─────────────────────────────────────────────────────────────────────
 
         # correlation readout
         lay.addSpacing(6)
@@ -685,6 +1025,7 @@ class WorkflowGUI(QMainWindow):
         import gc
         self._results = None
         self._save_btn.setEnabled(False)
+        self._spectral_btn.setEnabled(False)
         gc.collect()
         # ──────────────────────────────────────────────────────────────────────
 
@@ -725,6 +1066,7 @@ class WorkflowGUI(QMainWindow):
         self._run_btn.setEnabled(True)
         self._run_btn.setText("▶  RUN ANALYSIS")
         self._save_btn.setEnabled(True)
+        self._spectral_btn.setEnabled(True)          # ← enable after results ready
         self._status_lbl.setText(
             f"PID {r['pid']}  |  t = {r['time_instant']:.2f} ms  "
             f"|  ρ_orig = {r['corr_original']:.4f}  "
@@ -732,6 +1074,15 @@ class WorkflowGUI(QMainWindow):
         )
         self._plot_results(r)
         self._update_corr_readout(r)
+
+    # ── spectral analysis ─────────────────────────────────────────────────────
+
+    def _open_spectral_analysis(self):
+        """Open the spectral analysis dialog for the current results."""
+        if self._results is None:
+            return
+        dlg = SpectralAnalysisDialog(self._results, parent=self)
+        dlg.show()   # non-modal so both windows are usable simultaneously
 
     # ── plotting ──────────────────────────────────────────────────────────────
 
