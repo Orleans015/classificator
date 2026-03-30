@@ -5,6 +5,19 @@ Visualises the original profile, adjusted profile,
 reconstructed profile and the time-series correlation
 for a given shot PID.
 
+Outlier-detection methods
+--------------------------
+  1. Spline fit          – iterative smoothing spline on the spatial profile
+  2. Model residuals     – single-pass: flag diodes where
+                           (profile − AE(profile)) > mean + z·σ  (positive
+                           residuals only); z-threshold is user-configurable
+  3. Diode correlation   – per-diode Pearson ρ(signal, AE(signal))
+                           • Full time-series  : ρ computed over all time steps
+                           • Around peak       : ρ computed over a configurable
+                             window centred on the peak-emission instant
+                           Flagging threshold is either a fixed ρ cut-off
+                           or a statistical N·σ criterion.
+
 Requirements:
     pip install PyQt6 matplotlib numpy scipy torch
 """
@@ -112,6 +125,11 @@ QLineEdit {{
 QLineEdit:focus {{
     border: 1px solid {ACCENT};
 }}
+QLineEdit:disabled {{
+    background-color: #1a1d27;
+    color: {FG_DIM};
+    border: 1px solid {BORDER};
+}}
 QPushButton#run {{
     background-color: {ACCENT};
     color: #0f1117;
@@ -188,25 +206,23 @@ QComboBox {{
     border-radius: 3px;
     padding: 2px 4px;
 }}
+QComboBox:disabled {{
+    background-color: #1a1d27;
+    color: {FG_DIM};
+}}
 QComboBox QAbstractItemView {{
     background-color: #252836;
     color: {FG};
     selection-background-color: {ACCENT};
 }}
-QLabel#iter_header {{
-    color: {FG_DIM};
-    font-size: 8px;
-    font-weight: bold;
-}}
-QLabel#iter_row {{
-    color: {FG_DIM};
-    font-size: 8px;
-    font-family: monospace;
-}}
-QLabel#iter_best {{
+QLabel#diode_corr_header {{
     color: {ACCENT3};
-    font-size: 8px;
+    font-size: 9px;
     font-weight: bold;
+}}
+QLabel#diode_corr_row {{
+    color: {FG_DIM};
+    font-size: 8px;
     font-family: monospace;
 }}
 """
@@ -277,22 +293,6 @@ def apply_gain(profile: np.ndarray,
     return adjusted
 
 
-def detect_outliers_residual(profile: np.ndarray,
-                              reconstruction: np.ndarray,
-                              z_thresh: float) -> np.ndarray:
-    """
-    Flag diodes where  (profile - reconstruction) > mean + z_thresh * std.
-
-    Only positive residuals are caught: diodes whose signal sits well above
-    what the autoencoder expects.  Diodes that were over-corrected downward
-    in a previous iteration naturally have negative residuals here and
-    therefore self-heal by dropping out of the mask.
-    """
-    residuals = profile - reconstruction
-    threshold = np.mean(residuals) + z_thresh * np.std(residuals)
-    return residuals > threshold
-
-
 def fill_outlier_gaps(outlier_mask: np.ndarray,
                       profile: np.ndarray,
                       tol: float = 0.10) -> np.ndarray:
@@ -320,119 +320,112 @@ def fill_outlier_gaps(outlier_mask: np.ndarray,
     return filled
 
 
-# ── Iterative model-residuals outlier refinement ──────────────────────────────
+# ── Single-pass model-residuals outlier detection ────────────────────────────
 
-def iterative_residual_detection(
-        model,
-        profile:       np.ndarray,
-        rec_original:  np.ndarray,
-        gain_ratio:    float,
-        min_data:      float,
-        max_data:      float,
-        z_thresh:      float,
-        max_iter:      int,
-        progress_cb=None,
-) -> dict:
+def detect_outliers_residual(profile: np.ndarray,
+                              reconstruction: np.ndarray,
+                              z_thresh: float) -> np.ndarray:
     """
-    Iteratively refine the outlier mask using model residuals.
+    Flag diodes where  (profile − reconstruction) > mean + z_thresh · std.
 
-    Algorithm
-    ---------
-    1.  Seed the outlier mask from the residuals of the *original* profile
-        vs its reconstruction (rec_original).
-    2.  At each iteration:
-        a.  Build ``adjusted`` by applying the gain correction to the
-            *original* profile using the current mask — we always correct
-        from the raw signal, never from a previously adjusted version.
-        b.  Run the autoencoder on ``adjusted`` to get ``rec_adjusted``.
-        c.  Record ``corr(adjusted, rec_adjusted)`` and update the best
-            result if improved.
-        d.  Re-detect outliers from the residuals of
-            ``adjusted - rec_adjusted``.  False positives (diodes that were
-            over-corrected and now sit below the reconstruction) produce
-            *negative* residuals and therefore fall out of the mask
-            automatically on the next pass.  False negatives (diodes that
-            still deviate after correction) produce positive residuals and
-            get picked up.
-    3.  Stop when the mask is identical to the previous iteration
-        (convergence) or ``max_iter`` is reached.
-    4.  Return the result that achieved the highest correlation.
+    Only positive residuals are caught: diodes whose signal sits well above
+    what the autoencoder expects given the rest of the spatial profile.
+    """
+    residuals = profile - reconstruction
+    threshold = np.mean(residuals) + z_thresh * np.std(residuals)
+    return residuals > threshold
+
+
+# ── Diode-correlation outlier detection ───────────────────────────────────────
+
+def compute_diode_correlations(
+        model,
+        signals:     np.ndarray,
+        min_data:    float,
+        max_data:    float,
+        mode:        str = "full",
+        peak_idx:    int  = None,
+        window_size: int  = 100,
+        batch_size:  int  = 256,
+        progress_cb  = None,
+) -> np.ndarray:
+    """
+    Compute per-diode Pearson ρ(signal, AE(signal)) across the time axis.
+
+    Parameters
+    ----------
+    signals : (n_diodes, n_time) float32
+    mode    : "full"   → use every time step
+              "window" → use `window_size` steps centred on `peak_idx`
+    peak_idx   : required when mode == "window"
+    window_size: half-width of the temporal window (total steps = window_size)
 
     Returns
     -------
-    dict with keys:
-        adjusted        – best gain-corrected profile  (n_diodes,)
-        rec_adjusted    – AE reconstruction of best adjusted profile
-        outlier_mask    – boolean mask for best iteration
-        mask            – ~outlier_mask
-        corr_adjusted   – best Pearson ρ
-        history         – list of (iter, corr, n_outliers) tuples
-        converged       – bool
-        best_iter       – 1-based index of the best iteration
+    diode_corrs : (n_diodes,) float32
+        Pearson ρ for each diode.
     """
     def _p(msg):
         if progress_cb:
             progress_cb(msg)
 
-    # ── seed ──────────────────────────────────────────────────────────────────
-    outlier_mask = detect_outliers_residual(profile, rec_original, z_thresh)
-    outlier_mask = fill_outlier_gaps(outlier_mask, profile, tol=0.1)
+    n_diodes, n_time = signals.shape
 
-    best_corr     = -np.inf
-    best_adjusted = None
-    best_rec      = None
-    best_mask     = None
-    best_iter     = 1
-    history       = []          # [(iter_no, corr, n_outliers), …]
-    converged     = False
+    if mode == "window":
+        if peak_idx is None:
+            raise ValueError("peak_idx is required when mode='window'")
+        half  = window_size // 2
+        start = max(0, peak_idx - half)
+        end   = min(n_time, peak_idx + half)
+        _p(f"[Diode corr] Using window [{start}, {end}] "
+           f"({end - start} steps) around peak @ t_idx={peak_idx} …")
+        sigs_use = signals[:, start:end]
+    else:
+        _p(f"[Diode corr] Using full time-series ({n_time} steps) …")
+        sigs_use = signals
 
-    for it in range(1, max_iter + 1):
-        _p(f"[Residuals] Iteration {it}/{max_iter} — "
-           f"{outlier_mask.sum()} outliers …")
+    n_t  = sigs_use.shape[1]
+    rec  = np.empty_like(sigs_use)
 
-        # ── a. apply gain to the original profile with current mask ───────────
-        adjusted     = apply_gain(profile, outlier_mask, gain_ratio)
+    for s in range(0, n_t, batch_size):
+        e     = min(s + batch_size, n_t)
+        batch = normalize(sigs_use[:, s:e].T, min_data, max_data)   # (b, n_d)
+        out   = model_forward_batch(model, batch)                    # (b, n_d)
+        rec[:, s:e] = denormalize(out.T, min_data, max_data)
+        del batch, out
 
-        # ── b. reconstruct ────────────────────────────────────────────────────
-        rec_adjusted = reconstruct(model, adjusted, min_data, max_data)
-
-        # ── c. evaluate ───────────────────────────────────────────────────────
-        corr = pearson(adjusted, rec_adjusted)
-        history.append((it, corr, int(outlier_mask.sum())))
-
-        if corr > best_corr:
-            best_corr     = corr
-            best_adjusted = adjusted.copy()
-            best_rec      = rec_adjusted.copy()
-            best_mask     = outlier_mask.copy()
-            best_iter     = it
-
-        # ── d. re-detect on the adjusted profile ──────────────────────────────
-        new_mask = detect_outliers_residual(adjusted, rec_adjusted, z_thresh)
-        new_mask = fill_outlier_gaps(new_mask, adjusted, tol=0.1)
-
-        if np.array_equal(new_mask, outlier_mask):
-            converged = True
-            _p(f"[Residuals] Converged at iteration {it}  "
-               f"(best ρ = {best_corr:.4f} @ iter {best_iter})")
-            break
-
-        outlier_mask = new_mask
-
-    if not converged:
-        _p(f"[Residuals] Reached max_iter={max_iter}  "
-           f"(best ρ = {best_corr:.4f} @ iter {best_iter})")
-
-    return dict(
-        adjusted      = best_adjusted,
-        rec_adjusted  = best_rec,
-        outlier_mask  = best_mask,
-        mask          = ~best_mask,
-        corr_adjusted = best_corr,
-        history       = history,
-        converged     = converged,
-        best_iter     = best_iter,
+    diode_corrs = np.array(
+        [pearson(sigs_use[i], rec[i]) for i in range(n_diodes)],
+        dtype=np.float32,
     )
+    _p(f"[Diode corr] ρ range: [{diode_corrs.min():.4f}, "
+       f"{diode_corrs.max():.4f}]  mean={diode_corrs.mean():.4f}")
+    return diode_corrs
+
+
+def detect_outliers_diode_corr(
+        diode_corrs:     np.ndarray,
+        threshold_mode:  str   = "fixed",
+        rho_threshold:   float = 0.9,
+        z_thresh:        float = 2.0,
+) -> np.ndarray:
+    """
+    Return a boolean outlier mask based on per-diode correlation scores.
+
+    threshold_mode="fixed"
+        Flag diodes where  ρ < rho_threshold.
+
+    threshold_mode="statistical"
+        Flag diodes where  ρ < mean(ρ) − z_thresh · std(ρ).
+        This is scale-invariant: it catches diodes that are unusually
+        poorly reconstructed *relative to the rest of the array*.
+    """
+    if threshold_mode == "statistical":
+        mu  = float(np.mean(diode_corrs))
+        sig = float(np.std(diode_corrs))
+        return diode_corrs < (mu - z_thresh * sig)
+    else:
+        return diode_corrs < rho_threshold
 
 
 # ── Batched helpers ───────────────────────────────────────────────────────────
@@ -507,29 +500,43 @@ class AnalysisWorker(QObject):
     error    = pyqtSignal(str)
 
     def __init__(self, pid, model_path, min_data, max_data, gain_ratio,
-                 use_spline=True, z_thresh=0.2, max_iter=20):
+                 method="spline",
+                 z_thresh=2.0,
+                 corr_mode="full",
+                 corr_thresh_mode="fixed",
+                 corr_rho_thresh=0.9,
+                 corr_z_thresh=2.0,
+                 corr_window_size=100):
         super().__init__()
-        self.pid        = pid
-        self.model_path = model_path
-        self.min_data   = min_data
-        self.max_data   = max_data
-        self.gain_ratio = gain_ratio
-        self.use_spline = use_spline
-        self.z_thresh   = z_thresh
-        self.max_iter   = max_iter
+        self.pid             = pid
+        self.model_path      = model_path
+        self.min_data        = min_data
+        self.max_data        = max_data
+        self.gain_ratio      = gain_ratio
+        self.method          = method
+        self.z_thresh        = z_thresh
+        self.corr_mode       = corr_mode
+        self.corr_thresh_mode = corr_thresh_mode
+        self.corr_rho_thresh = corr_rho_thresh
+        self.corr_z_thresh   = corr_z_thresh
+        self.corr_window_size = corr_window_size
 
     def run(self):
         try:
             results = run_analysis(
                 self.pid, self.model_path,
                 self.min_data, self.max_data, self.gain_ratio,
-                use_spline   = self.use_spline,
-                z_thresh     = self.z_thresh,
-                max_iter     = self.max_iter,
-                progress_cb  = self.progress.emit,
+                method           = self.method,
+                z_thresh         = self.z_thresh,
+                corr_mode        = self.corr_mode,
+                corr_thresh_mode = self.corr_thresh_mode,
+                corr_rho_thresh  = self.corr_rho_thresh,
+                corr_z_thresh    = self.corr_z_thresh,
+                corr_window_size = self.corr_window_size,
+                progress_cb      = self.progress.emit,
             )
             self.finished.emit(results)
-        except Exception as exc:
+        except Exception:
             import traceback
             self.error.emit(traceback.format_exc())
 
@@ -539,7 +546,13 @@ class AnalysisWorker(QObject):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
-                 use_spline=True, z_thresh=0.2, max_iter=20,
+                 method="spline",
+                 z_thresh=2.0,
+                 corr_mode="full",
+                 corr_thresh_mode="fixed",
+                 corr_rho_thresh=0.9,
+                 corr_z_thresh=2.0,
+                 corr_window_size=100,
                  progress_cb=None):
     import gc
     import torch
@@ -598,14 +611,16 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
     n_diodes     = len(profile)
     x            = np.arange(n_diodes)
 
-    # ── original reconstruction ───────────────────────────────────────────────
+    # ── original reconstruction (single profile snapshot) ────────────────────
     _p("Running model on original profile …")
     rec_original  = reconstruct(model, profile, min_data, max_data)
     corr_original = pearson(profile, rec_original)
 
-    # ── outlier detection ─────────────────────────────────────────────────────
-    if use_spline:
-        # ── iterative spline fit (unchanged) ──────────────────────────────────
+    # ── outlier detection — branch on method ─────────────────────────────────
+    diode_corrs = None   # only populated for method == "diode_corr"
+
+    if method == "spline":
+        # ── iterative spline fit ───────────────────────────────────────────
         _p("Running iterative spline fit …")
         mask        = np.ones(n_diodes, dtype=bool)
         best_spline = None
@@ -636,41 +651,59 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
             best_spline = spline
         del spline, svals, residuals
 
-        spline_final = best_spline(x)
-        outlier_mask = ~mask
-        outlier_mask = fill_outlier_gaps(outlier_mask, profile, tol=0.1)
-        mask         = ~outlier_mask
-
-        adjusted     = apply_gain(profile, outlier_mask, gain_ratio)
-        rec_adjusted = reconstruct(model, adjusted, min_data, max_data)
+        spline_final  = best_spline(x)
+        outlier_mask  = ~mask
+        outlier_mask  = fill_outlier_gaps(outlier_mask, profile, tol=0.1)
+        mask          = ~outlier_mask
+        adjusted      = apply_gain(profile, outlier_mask, gain_ratio)
+        rec_adjusted  = reconstruct(model, adjusted, min_data, max_data)
         corr_adjusted = pearson(adjusted, rec_adjusted)
-        iter_history  = None
-        converged     = None
-        best_iter     = None
 
-    else:
-        # ── iterative model-residuals detection ───────────────────────────────
-        _p("Running iterative model-residuals outlier detection …")
-        res = iterative_residual_detection(
+    elif method == "residuals":
+        # ── model residuals detection (single pass) ────────────────────────
+        _p(f"Running single-pass model-residuals detection (z={z_thresh}) …")
+        outlier_mask  = detect_outliers_residual(profile, rec_original, z_thresh)
+        outlier_mask  = fill_outlier_gaps(outlier_mask, profile, tol=0.1)
+        mask          = ~outlier_mask
+        _p(f"[Residuals] {int(outlier_mask.sum())} diodes flagged.")
+        adjusted      = apply_gain(profile, outlier_mask, gain_ratio)
+        rec_adjusted  = reconstruct(model, adjusted, min_data, max_data)
+        corr_adjusted = pearson(adjusted, rec_adjusted)
+        spline_final  = rec_original   # use original AE rec as reference curve
+
+    elif method == "diode_corr":
+        # ── diode-correlation detection (single pass) ──────────────────────
+        _p("Computing per-diode correlations …")
+        diode_corrs = compute_diode_correlations(
             model        = model,
-            profile      = profile,
-            rec_original = rec_original,
-            gain_ratio   = gain_ratio,
+            signals      = signals,
             min_data     = min_data,
             max_data     = max_data,
-            z_thresh     = z_thresh,
-            max_iter     = max_iter,
+            mode         = corr_mode,
+            peak_idx     = max_emission,
+            window_size  = corr_window_size,
             progress_cb  = progress_cb,
         )
-        adjusted      = res["adjusted"]
-        rec_adjusted  = res["rec_adjusted"]
-        outlier_mask  = res["outlier_mask"]
-        mask          = res["mask"]
-        corr_adjusted = res["corr_adjusted"]
-        iter_history  = res["history"]
-        converged     = res["converged"]
-        best_iter     = res["best_iter"]
+        _p(f"[Diode corr] Flagging outliers "
+           f"(mode={corr_thresh_mode}, "
+           + (f"ρ<{corr_rho_thresh}" if corr_thresh_mode == "fixed"
+              else f"N={corr_z_thresh}σ") + ") …")
+        outlier_mask  = detect_outliers_diode_corr(
+            diode_corrs,
+            threshold_mode = corr_thresh_mode,
+            rho_threshold  = corr_rho_thresh,
+            z_thresh       = corr_z_thresh,
+        )
+        outlier_mask  = fill_outlier_gaps(outlier_mask, profile, tol=0.1)
+        mask          = ~outlier_mask
+        _p(f"[Diode corr] {int(outlier_mask.sum())} diodes flagged.")
+        adjusted      = apply_gain(profile, outlier_mask, gain_ratio)
+        rec_adjusted  = reconstruct(model, adjusted, min_data, max_data)
+        corr_adjusted = pearson(adjusted, rec_adjusted)
         spline_final  = rec_original   # use original AE rec as reference curve
+
+    else:
+        raise ValueError(f"Unknown method: {method!r}")
 
     gc.collect()
 
@@ -716,12 +749,16 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
         diode_signal      = diode_ref[indices],
         file_path         = fpath,
         diode_keys        = diode_keys,
-        use_spline        = use_spline,
+        method            = method,
         signals_sampled   = signals_sampled,
-        # residual-method extras (None when spline is used)
-        iter_history      = iter_history,
-        converged         = converged,
-        best_iter         = best_iter,
+        # diode-correlation method extras (None when not used)
+        diode_corrs       = diode_corrs,
+        corr_mode         = corr_mode,
+        corr_thresh_mode  = corr_thresh_mode,
+        corr_rho_thresh   = corr_rho_thresh,
+        corr_z_thresh     = corr_z_thresh,
+        # residuals method extras
+        z_thresh          = z_thresh,
     )
 
 
@@ -1070,25 +1107,62 @@ class WorkflowGUI(QMainWindow):
         lay.addWidget(gain_row)
 
         section("OUTLIER DETECTION")
+
+        # ── method toggle ─────────────────────────────────────────────────────
         method_row = QWidget()
         method_h   = QHBoxLayout(method_row)
         method_h.setContentsMargins(0, 0, 0, 0)
         method_h.setSpacing(4)
-        self._method_spline = QPushButton("Spline fit")
-        self._method_resid  = QPushButton("Model residuals")
-        for btn in (self._method_spline, self._method_resid):
+        self._method_spline    = QPushButton("Spline")
+        self._method_residuals = QPushButton("Residuals")
+        self._method_corrdiode = QPushButton("Diode ρ")
+        for btn in (self._method_spline, self._method_residuals,
+                    self._method_corrdiode):
             btn.setObjectName("method_btn")
             btn.setCheckable(True)
             method_h.addWidget(btn)
         self._method_spline.setChecked(True)
-        self._method_spline.clicked.connect(
-            lambda: self._method_resid.setChecked(False))
-        self._method_resid.clicked.connect(
-            lambda: self._method_spline.setChecked(False))
+        self._method_spline.clicked.connect(self._on_method_toggle)
+        self._method_residuals.clicked.connect(self._on_method_toggle)
+        self._method_corrdiode.clicked.connect(self._on_method_toggle)
         lay.addWidget(method_row)
 
-        self._z_edit        = field("Z-threshold  (residuals only)", "0.2")
-        self._maxiter_edit  = field("Max iterations  (residuals only)", "20")
+        # ── residuals controls ────────────────────────────────────────────────
+        lay.addWidget(_lbl("Z-threshold  (residuals only)"))
+        self._z_edit = _entry("2.0")
+        lay.addWidget(self._z_edit)
+
+        # ── diode-correlation controls ────────────────────────────────────────
+        lay.addSpacing(6)
+        lay.addWidget(_lbl("Correlation mode"))
+        self._corr_mode_combo = QComboBox()
+        self._corr_mode_combo.addItems(["Full time-series", "Around peak (window)"])
+        self._corr_mode_combo.currentIndexChanged.connect(
+            self._on_corr_mode_changed)
+        lay.addWidget(self._corr_mode_combo)
+
+        lay.addWidget(_lbl("Window size  (around peak, steps)"))
+        self._corr_window_edit = _entry("100")
+        lay.addWidget(self._corr_window_edit)
+
+        lay.addSpacing(4)
+        lay.addWidget(_lbl("Threshold mode"))
+        self._corr_thresh_combo = QComboBox()
+        self._corr_thresh_combo.addItems(["Fixed ρ", "Statistical  (N·σ below mean)"])
+        self._corr_thresh_combo.currentIndexChanged.connect(
+            self._on_thresh_mode_changed)
+        lay.addWidget(self._corr_thresh_combo)
+
+        lay.addWidget(_lbl("Fixed ρ threshold  (flag if ρ < value)"))
+        self._corr_rho_edit = _entry("0.9")
+        lay.addWidget(self._corr_rho_edit)
+
+        lay.addWidget(_lbl("N  (flag if ρ < mean − N·σ)"))
+        self._corr_z_edit = _entry("2.0")
+        lay.addWidget(self._corr_z_edit)
+
+        # ── initialise enable / disable state ─────────────────────────────────
+        self._on_method_toggle()
 
         # ── action buttons ────────────────────────────────────────────────────
         lay.addStretch()
@@ -1112,13 +1186,57 @@ class WorkflowGUI(QMainWindow):
         self._spectral_btn.clicked.connect(self._open_spectral_analysis)
         lay.addWidget(self._spectral_btn)
 
-        # ── correlation / iteration readout ───────────────────────────────────
+        # ── correlation / diode-corr readout ──────────────────────────────────
         lay.addSpacing(6)
         self._corr_widget = QWidget()
         self._corr_layout = QGridLayout(self._corr_widget)
         self._corr_layout.setContentsMargins(0, 0, 0, 0)
         self._corr_layout.setSpacing(3)
         lay.addWidget(self._corr_widget)
+
+    # ── method / threshold enable / disable ───────────────────────────────────
+
+    def _on_method_toggle(self):
+        """Keep the three method buttons mutually exclusive and grey controls."""
+        sender = self.sender()
+        # Enforce mutual exclusion: uncheck the other two
+        all_btns = (self._method_spline,
+                    self._method_residuals,
+                    self._method_corrdiode)
+        for btn in all_btns:
+            btn.setChecked(btn is sender)
+
+        # If sender ended up unchecked (user clicked the already-active button),
+        # keep it checked — always have exactly one active.
+        if not any(b.isChecked() for b in all_btns):
+            self._method_spline.setChecked(True)
+
+        is_residuals = self._method_residuals.isChecked()
+        is_diodecorr = self._method_corrdiode.isChecked()
+
+        self._z_edit.setEnabled(is_residuals)
+
+        self._corr_mode_combo.setEnabled(is_diodecorr)
+        self._corr_thresh_combo.setEnabled(is_diodecorr)
+        if is_diodecorr:
+            self._on_corr_mode_changed()
+            self._on_thresh_mode_changed()
+        else:
+            self._corr_window_edit.setEnabled(False)
+            self._corr_rho_edit.setEnabled(False)
+            self._corr_z_edit.setEnabled(False)
+
+    def _on_corr_mode_changed(self):
+        window_mode = self._corr_mode_combo.currentText().startswith("Around")
+        self._corr_window_edit.setEnabled(
+            window_mode and self._method_corrdiode.isChecked())
+
+    def _on_thresh_mode_changed(self):
+        if not self._method_corrdiode.isChecked():
+            return
+        fixed = self._corr_thresh_combo.currentIndex() == 0
+        self._corr_rho_edit.setEnabled(fixed)
+        self._corr_z_edit.setEnabled(not fixed)
 
     def _build_plots(self, parent):
         lay = QVBoxLayout(parent)
@@ -1135,6 +1253,8 @@ class WorkflowGUI(QMainWindow):
         self._ax_rec  = self._fig.add_subplot(gs[1, 0])
         self._ax_corr = self._fig.add_subplot(gs[1, 1])
         self.twin_ax_corr = self._ax_corr.twinx()
+        # secondary axis for per-diode ρ overlay in panel 2
+        self._twin_ax_adj = self._ax_adj.twinx()
 
         for ax, title in [
             (self._ax_orig, "Original profile  vs  Reconstruction"),
@@ -1183,21 +1303,36 @@ class WorkflowGUI(QMainWindow):
             QMessageBox.critical(self, "Parameter error", str(e))
             return
 
+        method = ("spline"     if self._method_spline.isChecked() else
+                  "residuals"  if self._method_residuals.isChecked() else
+                  "diode_corr")
+
+        corr_mode        = ("full" if self._corr_mode_combo.currentIndex() == 0
+                            else "window")
+        corr_thresh_mode = ("fixed" if self._corr_thresh_combo.currentIndex() == 0
+                            else "statistical")
+        try:
+            z_thresh = float(self._z_edit.text())
+        except ValueError:
+            z_thresh = 2.0
+        try:
+            corr_rho_thresh = float(self._corr_rho_edit.text())
+        except ValueError:
+            corr_rho_thresh = 0.9
+        try:
+            corr_z_thresh = float(self._corr_z_edit.text())
+        except ValueError:
+            corr_z_thresh = 2.0
+        try:
+            corr_window_size = int(self._corr_window_edit.text())
+        except ValueError:
+            corr_window_size = 100
+
         import gc
         self._results = None
         self._save_btn.setEnabled(False)
         self._spectral_btn.setEnabled(False)
         gc.collect()
-
-        use_spline = self._method_spline.isChecked()
-        try:
-            z_thresh = float(self._z_edit.text())
-        except ValueError:
-            z_thresh = 0.2
-        try:
-            max_iter = int(self._maxiter_edit.text())
-        except ValueError:
-            max_iter = 20
 
         self._run_btn.setEnabled(False)
         self._run_btn.setText("⏳  Running …")
@@ -1206,9 +1341,13 @@ class WorkflowGUI(QMainWindow):
         self._thread = QThread()
         self._worker = AnalysisWorker(
             pid, model_path, min_data, max_data, gain_ratio,
-            use_spline = use_spline,
-            z_thresh   = z_thresh,
-            max_iter   = max_iter,
+            method           = method,
+            z_thresh         = z_thresh,
+            corr_mode        = corr_mode,
+            corr_thresh_mode = corr_thresh_mode,
+            corr_rho_thresh  = corr_rho_thresh,
+            corr_z_thresh    = corr_z_thresh,
+            corr_window_size = corr_window_size,
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -1232,18 +1371,10 @@ class WorkflowGUI(QMainWindow):
         self._save_btn.setEnabled(True)
         self._spectral_btn.setEnabled(True)
 
-        conv_note = ""
-        if not r["use_spline"] and r.get("converged") is not None:
-            conv_note = (
-                f"  |  converged={'yes' if r['converged'] else 'no'}"
-                f"  iter={r['best_iter']}"
-            )
-
         self._status_lbl.setText(
             f"PID {r['pid']}  |  t = {r['time_instant']:.2f} ms"
             f"  |  ρ_orig = {r['corr_original']:.4f}"
             f"  |  ρ_adj = {r['corr_adjusted']:.4f}"
-            f"{conv_note}"
         )
         self._plot_results(r)
         self._update_corr_readout(r)
@@ -1268,6 +1399,11 @@ class WorkflowGUI(QMainWindow):
         self.twin_ax_corr.yaxis.set_label_position("right")
         self.twin_ax_corr.yaxis.tick_right()
 
+        # Clear and reset the twin axis for panel 2
+        self._twin_ax_adj.cla()
+        self._twin_ax_adj.yaxis.set_label_position("right")
+        self._twin_ax_adj.yaxis.tick_right()
+
         x, ti, pid = r["x"], r["time_instant"], r["pid"]
 
         # ── panel 1: original vs AE ───────────────────────────────────────────
@@ -1280,10 +1416,10 @@ class WorkflowGUI(QMainWindow):
         ax.set_ylabel("Signal [V]")
         ax.legend(fontsize=8)
 
-        # ── panel 2: adjusted profile with outliers ───────────────────────────
+        # ── panel 2: adjusted profile with outliers (+ per-diode ρ overlay) ──
         ax  = self._ax_adj
         out = r["outlier_mask"]
-        ref_label = "Spline fit" if r["use_spline"] else "AE reconstruction"
+        ref_label = "Spline fit" if r["method"] == "spline" else "AE reconstruction"
         ax.plot(x, r["profile"],      color=FG_DIM,  lw=1.2, ls="--",
                 alpha=0.6, label="Original")
         ax.plot(x, r["adjusted"],     color=ACCENT3, lw=1.8, label="Adjusted")
@@ -1293,12 +1429,68 @@ class WorkflowGUI(QMainWindow):
             ax.scatter(x[out], r["profile"][out],
                        color=ACCENT4, marker="x", s=80, lw=1.8,
                        label=f"Outliers ({out.sum()})", zorder=5)
-        method_label = "Spline fit" if r["use_spline"] else \
-                       f"Model residuals (iter {r.get('best_iter', '?')})"
-        ax.set_title(f"Adjusted Profile  [{method_label}]", color=FG, pad=8)
+
+        # --- per-diode ρ overlay (diode_corr method only) --------------------
+        diode_corrs = r.get("diode_corrs")
+        if diode_corrs is not None:
+            twin = self._twin_ax_adj
+            twin.plot(x, diode_corrs, color=ACCENT, lw=1.2, alpha=0.75,
+                      ls="-", label="Diode ρ (AE)")
+
+            # Shade the flagging threshold band
+            thresh_mode = r.get("corr_thresh_mode", "fixed")
+            if thresh_mode == "fixed":
+                thresh_val = float(r.get("corr_rho_thresh", 0.9))
+                twin.axhline(thresh_val, color=WARNING, lw=1.0, ls="--",
+                             alpha=0.8, label=f"ρ threshold ({thresh_val:.2f})")
+            else:
+                mu  = float(np.mean(diode_corrs))
+                sig = float(np.std(diode_corrs))
+                nz  = float(r.get("corr_z_thresh", 2.0))
+                thresh_val = mu - nz * sig
+                twin.axhline(thresh_val, color=WARNING, lw=1.0, ls="--",
+                             alpha=0.8,
+                             label=f"μ−{nz:.1f}σ  ({thresh_val:.3f})")
+                twin.axhline(mu, color=FG_DIM, lw=0.8, ls=":",
+                             alpha=0.5, label=f"mean ρ ({mu:.3f})")
+
+            # Highlight flagged diodes on the ρ curve
+            if out.any():
+                twin.scatter(x[out], diode_corrs[out],
+                             color=ACCENT4, s=40, zorder=6, marker="o",
+                             label=f"Flagged ({out.sum()})")
+
+            twin.set_ylabel("Diode ρ  (AE recon)", color=ACCENT, fontsize=8)
+            twin.tick_params(axis="y", labelcolor=ACCENT, labelsize=7)
+            twin.set_ylim(-0.05, 1.05)
+            twin.set_facecolor(PANEL)
+
+            # Merge legends from both axes
+            l1, lb1 = ax.get_legend_handles_labels()
+            l2, lb2 = twin.get_legend_handles_labels()
+            ax.legend(l1 + l2, lb1 + lb2, fontsize=7, loc="upper right",
+                      ncol=2)
+
+            # Build a descriptive title
+            mode_str = (r.get("corr_mode", "full")
+                        .replace("full", "full t-series")
+                        .replace("window", "around peak"))
+            ax.set_title(
+                f"Adjusted Profile  [Diode correlation — {mode_str}]",
+                color=FG, pad=8)
+            self._twin_ax_adj.set_visible(True)
+
+        else:
+            ax.legend(fontsize=8)
+            method_label = {
+                "spline":    "Spline fit",
+                "residuals": f"Model residuals  (z={r.get('z_thresh', '?')})",
+            }.get(r["method"], r["method"])
+            ax.set_title(f"Adjusted Profile  [{method_label}]", color=FG, pad=8)
+            self._twin_ax_adj.set_visible(False)
+
         ax.set_xlabel("Diode index")
         ax.set_ylabel("Signal [V]")
-        ax.legend(fontsize=8)
 
         # ── panel 3: adjusted + AE reconstruction ────────────────────────────
         ax = self._ax_rec
@@ -1371,53 +1563,79 @@ class WorkflowGUI(QMainWindow):
         self._corr_layout.addWidget(v_lbl, row, 0, 1, 2)
         row += 1
 
-        # ── iteration history (residuals method only) ─────────────────────────
-        history = r.get("iter_history")
-        if history:
+        # ── residuals method summary ──────────────────────────────────────────
+        if r.get("method") == "residuals":
             row += 1
-            div = _divider()
-            self._corr_layout.addWidget(div, row, 0, 1, 2)
+            self._corr_layout.addWidget(_divider(), row, 0, 1, 2)
             row += 1
-
-            # header
-            hdr_it  = QLabel("iter")
-            hdr_rho = QLabel("ρ adj")
-            hdr_n   = QLabel("#out")
-            for w in (hdr_it, hdr_rho, hdr_n):
-                w.setObjectName("iter_header")
-                w.setAlignment(Qt.AlignmentFlag.AlignRight)
-            self._corr_layout.addWidget(hdr_it,  row, 0)
-            self._corr_layout.addWidget(hdr_rho, row, 1)
-
-            # add a third column for n_outliers
-            self._corr_layout.setColumnStretch(2, 1)
-            hdr_n.setAlignment(Qt.AlignmentFlag.AlignRight)
-            self._corr_layout.addWidget(hdr_n, row, 2)
+            hdr = QLabel("── Residuals detection ──")
+            hdr.setObjectName("diode_corr_header")
+            hdr.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._corr_layout.addWidget(hdr, row, 0, 1, 2)
             row += 1
-
-            best_iter = r.get("best_iter", -1)
-            for (it, corr, n_out) in history:
-                is_best = (it == best_iter)
-                obj_name = "iter_best" if is_best else "iter_row"
-                star = "★" if is_best else " "
-
-                w_it  = QLabel(f"{star}{it:2d}")
-                w_rho = QLabel(f"{corr:.4f}")
-                w_n   = QLabel(f"{n_out:3d}")
-                for w in (w_it, w_rho, w_n):
-                    w.setObjectName(obj_name)
-                    w.setAlignment(Qt.AlignmentFlag.AlignRight)
-                self._corr_layout.addWidget(w_it,  row, 0)
-                self._corr_layout.addWidget(w_rho, row, 1)
-                self._corr_layout.addWidget(w_n,   row, 2)
+            n_out = int(r["outlier_mask"].sum())
+            for lbl_txt, val_txt in [
+                ("z-threshold", f"{r.get('z_thresh', '?')}"),
+                ("n flagged",   f"{n_out}"),
+            ]:
+                lbl_w = QLabel(lbl_txt + " :")
+                lbl_w.setObjectName("diode_corr_row")
+                val_w = QLabel(val_txt)
+                val_w.setObjectName("diode_corr_row")
+                val_w.setAlignment(Qt.AlignmentFlag.AlignRight)
+                self._corr_layout.addWidget(lbl_w, row, 0)
+                self._corr_layout.addWidget(val_w, row, 1)
                 row += 1
 
-            conv = r.get("converged")
-            if conv is not None:
-                note = QLabel("✓ converged" if conv else "⚠ max_iter reached")
-                note.setObjectName("iter_header")
-                note.setAlignment(Qt.AlignmentFlag.AlignRight)
-                self._corr_layout.addWidget(note, row, 0, 1, 3)
+        # ── diode-correlation summary (diode_corr method only) ────────────────
+        diode_corrs = r.get("diode_corrs")
+        if diode_corrs is not None:
+            row += 1
+            self._corr_layout.addWidget(_divider(), row, 0, 1, 2)
+            row += 1
+
+            hdr = QLabel("── Diode ρ statistics ──")
+            hdr.setObjectName("diode_corr_header")
+            hdr.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._corr_layout.addWidget(hdr, row, 0, 1, 2)
+            row += 1
+
+            n_diodes = len(diode_corrs)
+            n_out    = int(r["outlier_mask"].sum())
+            mu       = float(np.mean(diode_corrs))
+            sig      = float(np.std(diode_corrs))
+            rho_min  = float(diode_corrs.min())
+            rho_max  = float(diode_corrs.max())
+
+            mode_str = (r.get("corr_mode", "full")
+                        .replace("full",   "full t-series")
+                        .replace("window", "around peak"))
+            thresh_mode = r.get("corr_thresh_mode", "fixed")
+            if thresh_mode == "fixed":
+                thresh_str = f"ρ < {r.get('corr_rho_thresh', 0.9):.2f}"
+            else:
+                nz = float(r.get("corr_z_thresh", 2.0))
+                thresh_str = f"μ − {nz:.1f}σ  ({mu - nz*sig:.3f})"
+
+            stats = [
+                ("mode",      mode_str),
+                ("threshold", thresh_str),
+                ("n diodes",  f"{n_diodes}"),
+                ("n flagged", f"{n_out}"),
+                ("ρ mean",    f"{mu:.4f}"),
+                ("ρ std",     f"{sig:.4f}"),
+                ("ρ min",     f"{rho_min:.4f}"),
+                ("ρ max",     f"{rho_max:.4f}"),
+            ]
+            for lbl_txt, val_txt in stats:
+                lbl_w = QLabel(lbl_txt + " :")
+                lbl_w.setObjectName("diode_corr_row")
+                val_w = QLabel(val_txt)
+                val_w.setObjectName("diode_corr_row")
+                val_w.setAlignment(Qt.AlignmentFlag.AlignRight)
+                self._corr_layout.addWidget(lbl_w, row, 0)
+                self._corr_layout.addWidget(val_w, row, 1)
+                row += 1
 
     # ── save ──────────────────────────────────────────────────────────────────
 
