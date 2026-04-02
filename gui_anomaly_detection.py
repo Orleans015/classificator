@@ -539,6 +539,7 @@ def run_analysis(pid, model_path, min_data, max_data, gain_ratio,
         profile           = profile,
         rec_original      = rec_original,
         outlier_mask      = outlier_mask,
+        gain_ratio        = gain_ratio,
         mask              = mask,
         adjusted          = adjusted,
         rec_adjusted      = rec_adjusted,
@@ -1219,8 +1220,7 @@ class WorkflowGUI(QMainWindow):
             QMessageBox.warning(self, "No data", "Run the analysis first.")
             return
 
-        import h5py
-        from read_h5f import save_tfiles, format_pid
+        from read_h5f import save_tfiles, save_xfiles
 
         r             = self._results
         h5py_path     = r["file_path"]
@@ -1232,21 +1232,12 @@ class WorkflowGUI(QMainWindow):
         save_dir = os.path.join(os.path.dirname(h5py_path))
         os.makedirs(save_dir, exist_ok=True)
 
-        # Save also the  t000, t090, t180 and t270 files with adjusted keyword
-        save_tfiles(h5py_path)
-
         try:
-            for i, key in enumerate(diode_keys):
-                dst_path = os.path.join(
-                    save_dir,
-                    f"xmcts{format_pid(pid)}adjusted_x{key}.h5f"
-                )
-                with h5py.File(dst_path, "w") as f:
-                    grp = f.create_group("XMCTSdata")
-                    grp.create_dataset("timedata", data=timedata)
-                    grp.create_dataset(key,         data=adjusted_full[i, :])
-            self._status_lbl.setText(
-                f"Saved {len(diode_keys)} files → {save_dir}")
+            # Save the t000, t090, t180 and t270 files with adjusted keyword
+            save_tfiles(h5py_path)
+            # Save the x000, ..., x360 files with the adjusted data
+            save_xfiles(h5py_path, adjusted_full)
+
         except Exception as e:
             QMessageBox.critical(self, "Save failed", str(e))
 

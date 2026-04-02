@@ -119,6 +119,60 @@ def save_tfiles(h5py_path: str, keyword: str = 'adjusted'):
             shutil.copy2(h5f_file, new_h5f_file)
 
 
+def save_xfiles(h5py_path: str, adjusted_data: np.ndarray, keyword: str = 'adjusted'):
+    """
+    Duplicate HDF5 files and update specific internal datasets with adjusted data.
+
+    This function iterates through a directory, skipping specific reference 
+    orientation files. For all other files, it creates a copy with a modified 
+    filename containing a keyword. Inside each copy, it replaces the dataset 
+    corresponding to a specific diode index (000-360) within the 'XMCTSdata' 
+    group using the provided array.
+
+    Parameters
+    ----------
+    h5py_path : str
+        The system path to the directory containing the .h5f files.
+    adjusted_data : np.ndarray
+        The numerical array to be written into the 'XMCTSdata' dataset.
+    keyword : str, optional
+        The string to insert into the new filename (default is 'adjusted').
+        This is appended to the 3-digit experiment ID extracted from the 
+        original filename.
+
+    Returns
+    -------
+    None
+        New files are created and modified on the filesystem.
+    """
+    import shutil
+
+    REFERENCE_SUFFIXES = ("_t000.h5f", "_t090.h5f", "_t180.h5f", "_t270.h5f")
+    diodes = [f"{i:03}" for i in range(361)]
+    count = 0
+    
+    for f in sorted(os.listdir(h5py_path)):
+        # Process only files that are NOT the reference suffixes
+        if not f.endswith(REFERENCE_SUFFIXES):
+            print(f)
+            h5f_file = os.path.join(h5py_path, f)
+            
+            # Filename logic:
+            parts = f.split('_')
+            exp_num = parts[1][:3]
+            new_f = f"{parts[0]}_{exp_num}{keyword}_{parts[-1]}"
+            
+            new_h5f_file = os.path.join(h5py_path, new_f)
+            shutil.copy2(h5f_file, new_h5f_file)
+            
+            with h5py.File(new_h5f_file, 'r+') as nf:
+                # Replaces data in the dataset corresponding to the current count
+                # Example: nf['XMCTSdata']['000'] = adjusted_data
+                nf['XMCTSdata'][diodes[count]][...] = adjusted_data[count, :]
+            
+            count += 1
+
+
 def build_data_array(data_dict: dict) -> np.ndarray:
     """
     Stack all arrays in the data dictionary into a 2D numpy array.
